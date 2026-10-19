@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: memory-atlas-demo
+    runtime: python
+    plan: starter
+    buildCommand: python -m pip install -r requirements.txt
+    startCommand: >-
+      python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT
+      --proxy-headers --forwarded-allow-ips='*'
+    healthCheckPath: /api/health
+    autoDeploy: false
+    disk:
+      name: memory-atlas-demo-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DEMO_INVITATIONS_REQUIRED
+        value: "true"
+      - key: DATABASE_PATH
+        value: /var/data/memory-atlas-demo.sqlite3
+      - key: MODEL_PROVIDER
+        value: groq
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SESSION_COOKIE_AUTH
+        value: "true"
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: ENABLE_HSTS
+        value: "true"
+      - key: MAX_REQUEST_BODY_BYTES
+        value: "65536"
+      - key: REGISTER_RATE_LIMIT
+        value: "5"
+      - key: REGISTER_RATE_WINDOW_SECONDS
+        value: "3600"
+      - key: LOGIN_RATE_LIMIT
+        value: "10"
+      - key: LOGIN_RATE_WINDOW_SECONDS
+        value: "900"
+      - key: CHAT_RATE_LIMIT
+        value: "20"
+      - key: CHAT_RATE_WINDOW_SECONDS
+        value: "60"
+      - key: MODEL_ACTIONS_PER_USER_PER_DAY
+        value: "25"
+      - key: MODEL_ACTIONS_PER_DAY
+        value: "200"

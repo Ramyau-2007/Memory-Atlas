@@ -1,0 +1,5 @@
+[
+  {"id":"python-preference","history":["I prefer Python examples when learning."],"query":"Show me a Python example for sorting." ,"expected_memory":"Python examples"},
+  {"id":"dietary-preference","history":["I am vegetarian."],"query":"Suggest a simple vegetarian dinner for me.","expected_memory":"vegetarian"},
+  {"id":"unrelated","history":["I enjoy hiking on weekends."],"query":"Explain binary search.","expected_memory":null}
+]

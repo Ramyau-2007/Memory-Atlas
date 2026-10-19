@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#11152E">
+  <meta name="description" content="A transparent, user-controlled memory workspace for long-running AI conversations.">
+  <title>Memory Atlas</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#chat" aria-label="Memory Atlas home">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span><strong>Memory Atlas</strong><small>Personal context, in view</small></span>
+      </a>
+      <section class="chat-history" aria-label="Conversation history">
+        <div class="chat-history-heading"><span>CHATS</span><button class="new-chat-button" id="newChat" type="button"><span aria-hidden="true">＋</span> New chat</button></div>
+        <div class="conversation-list" id="conversationList" aria-label="Previous conversations"><p class="conversation-list-empty">Loading conversations…</p></div>
+      </section>
+      <div class="nav-label">WORKSPACE</div>
+      <nav class="primary-nav" aria-label="Workspace">
+        <button class="nav-item active" data-view="chat"><span class="nav-icon" aria-hidden="true">◌</span><span>AI Assistant</span><kbd>1</kbd></button>
+        <button class="nav-item" data-view="universe"><span class="nav-icon" aria-hidden="true">◎</span><span>Memory Universe</span><kbd>2</kbd></button>
+        <button class="nav-item" data-view="memories"><span class="nav-icon" aria-hidden="true">▤</span><span>All Memories</span><kbd>3</kbd></button>
+        <button class="nav-item" data-view="timeline"><span class="nav-icon" aria-hidden="true">⌁</span><span>Memory Timeline</span><kbd>4</kbd></button>
+        <button class="nav-item" data-view="analytics"><span class="nav-icon" aria-hidden="true">▥</span><span>Analytics</span><kbd>5</kbd></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="privacy-note"><span class="privacy-dot"></span><span>Private to your account</span></div>
+        <button class="nav-item" data-view="settings"><span class="nav-icon" aria-hidden="true">⚙</span><span>Settings & about</span></button>
+        <button class="nav-item signout" id="signOut"><span class="nav-icon" aria-hidden="true">↗</span><span>Sign out</span></button>
+        <div class="sidebar-foot">MEMORY ATLAS <span id="versionLabel">LOCAL POC</span></div>
+      </div>
+    </aside>
+
+    <main class="main-shell">
+      <header class="topbar">
+        <button class="icon-button mobile-menu" id="menuToggle" aria-label="Toggle navigation" aria-expanded="false">☰</button>
+        <div class="breadcrumbs"><span>Workspace</span><span class="crumb-divider">/</span><strong id="pageCrumb">AI Assistant</strong></div>
+        <div class="topbar-right"><span class="provider-pill"><i id="providerDot"></i><span id="providerLabel">Connecting</span></span><span class="avatar" aria-hidden="true">M</span></div>
+      </header>
+
+      <section class="auth-wrap" id="authPanel">
+        <div class="auth-card">
+          <div class="eyebrow">A QUIETER KIND OF INTELLIGENCE</div>
+          <h1>Your context,<br><em>thoughtfully kept.</em></h1>
+          <p>Sign in to explore a private memory space that keeps useful context close and gives you control over what stays.</p>
+          <form id="authForm" class="auth-form">
+            <label for="username">Username</label><input id="username" name="username" autocomplete="username" minlength="3" maxlength="64" required>
+            <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" minlength="10" maxlength="256" required>
+            <div id="invitationField" hidden><label for="invitationCode">Demo invitation code</label><input id="invitationCode" name="invitation_code" autocomplete="one-time-code" maxlength="160" aria-describedby="invitationHelp"><small id="invitationHelp">A one-time code from the demo organizer is required to create an account.</small></div>
+            <div class="auth-actions"><button class="button primary" type="submit" data-auth="login">Sign in <span aria-hidden="true">→</span></button><button class="button quiet" type="submit" data-auth="register">Create account</button></div>
+          </form>
+          <p class="form-message" id="authMessage" role="status" aria-live="polite"></p>
+          <p class="privacy-disclosure"><strong>Demo privacy:</strong> When Groq is enabled, your current message, selected recent messages, an extractive summary of recent user messages in longer chats, and up to three matching active memories may be sent to Groq. Some messages may also be sent alone for memory analysis. Avoid passwords, secrets, or sensitive personal information. Demo data remains stored until deleted or the demo is cleaned up.</p>
+          <div class="auth-foot"><span class="privacy-dot"></span> Your memories remain scoped to your account.</div>
+        </div>
+        <div class="auth-aside"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><span class="orbit-point point-one"></span><span class="orbit-point point-two"></span><div class="aside-copy"><span>01 / INTENTIONAL MEMORY</span><p>Keep the details that matter.<br>Leave the noise behind.</p></div></div>
+      </section>
+
+      <div class="workspace" id="workspace" hidden>
+        <div class="page-heading">
+          <div><div class="eyebrow" id="pageEyebrow">YOUR PRIVATE WORKSPACE</div><h1 id="pageTitle">AI Assistant</h1><p id="pageDescription">A conversation shaped by the context you choose to keep.</p></div>
+          <button class="button primary heading-action" id="addMemoryTop">＋ <span>Add memory</span></button>
+        </div>
+        <div class="status-message" id="statusMessage" role="status" aria-live="polite" hidden></div>
+
+        <section class="view active" id="view-chat" aria-labelledby="pageTitle">
+          <div class="chat-layout">
+            <div class="panel conversation-panel">
+              <div class="panel-head conversation-head"><div><span class="section-kicker">CONVERSATION</span><h2>A little more context.</h2></div><span class="live-badge"><i></i> Ready</span></div>
+              <div class="messages" id="messages" aria-live="polite" aria-label="Conversation">
+                <div class="welcome-state" id="welcomeState"><div class="welcome-mark" aria-hidden="true"><span></span><span></span><span></span></div><span class="eyebrow">A FRESH PAGE</span><h3>What would you like to think through?</h3><p>Ask a question or share a preference. Durable preferences are saved only when the local rules identify them as useful memory.</p><div class="suggestions"><button class="suggestion" data-prompt="I prefer concise explanations with practical examples.">“I prefer concise explanations…”</button><button class="suggestion" data-prompt="Help me plan a focused study session.">“Help me plan a study session…”</button></div></div>
+              </div>
+              <form class="composer" id="chatForm"><label class="sr-only" for="query">Message the assistant</label><textarea id="query" rows="1" maxlength="4000" placeholder="Write a message…" required></textarea><div class="composer-foot"><span><kbd>Enter</kbd> to send <span class="muted">· Shift + Enter for a new line</span></span><button class="send-button" id="send" type="submit" aria-label="Send message"><span>Send</span><b aria-hidden="true">↑</b></button></div></form>
+              <div class="conversation-note">Your messages are stored with your account. Avoid entering secrets or highly sensitive information.</div>
+            </div>
+            <aside class="panel inspector" aria-labelledby="inspectorTitle">
+              <div class="panel-head"><div><span class="section-kicker">TRANSPARENCY</span><h2 id="inspectorTitle">Context inspector</h2></div><span class="inspector-mark" aria-hidden="true">⌕</span></div>
+              <p class="panel-intro">See what informed the latest response.</p>
+              <div id="inspectorContent" class="inspector-content"><div class="inspector-empty"><span>◌</span><p>Context details will appear here after your first message.</p></div></div>
+              <div class="inspector-footer"><span class="privacy-dot"></span> Only your account's context is considered.</div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-universe" aria-labelledby="pageTitle" hidden>
+          <div class="panel universe-panel"><div class="panel-head"><div><span class="section-kicker">A MAP OF WHAT YOU KEEP</span><h2>Memory Universe</h2><p class="panel-intro">Each point is a saved memory. Lines connect entries that share at least two meaningful words.</p></div><div class="universe-count"><strong id="universeCount">—</strong><span>active memories</span></div></div>
+            <div class="universe-toolbar"><label class="searchbox"><span aria-hidden="true">⌕</span><input id="universeSearch" type="search" placeholder="Find a memory…" aria-label="Search universe memories"></label><label class="select-wrap"><span class="sr-only">Filter by category</span><select id="universeCategory"><option value="">All categories</option></select></label></div>
+            <div class="universe-layout"><div class="graph-wrap" id="graphWrap"><svg id="memoryGraph" viewBox="0 0 760 500" role="group" aria-label="Interactive map of stored memories"><g id="graphEdges"></g><g id="graphNodes"></g></svg><div class="graph-legend"><span><i class="legend-copper"></i> Preference</span><span><i class="legend-sage"></i> Fact</span><span><i class="legend-amber"></i> Goal</span></div></div><aside class="node-detail" id="nodeDetail" aria-live="polite"><span class="section-kicker">SELECTED MEMORY</span><div class="detail-empty"><span>◎</span><p>Select a point or a memory in the accessible list to inspect its details.</p></div></aside></div>
+            <div class="accessible-list"><div class="list-heading"><h3>Memory list</h3><span class="muted">Keyboard-accessible alternative to the map</span></div><div id="universeList" class="universe-list"></div></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-memories" aria-labelledby="pageTitle" hidden>
+          <div class="panel memory-panel"><div class="panel-head"><div><span class="section-kicker">YOUR PERSONAL ARCHIVE</span><h2>All memories</h2><p class="panel-intro">Review what has been saved, edit it, or remove it from active context.</p></div><button class="button primary" id="addMemory">＋ Add memory</button></div>
+            <div class="memory-toolbar"><label class="searchbox"><span aria-hidden="true">⌕</span><input id="memorySearch" type="search" placeholder="Search saved memories…" aria-label="Search memories"></label><label class="select-wrap"><span class="sr-only">Filter by category</span><select id="memoryCategory"><option value="">All categories</option></select></label><label class="select-wrap"><span class="sr-only">Choose memory status</span><select id="memoryStatus"><option value="active">Active</option><option value="deleted">Deleted / recovery</option></select></label><label class="select-wrap"><span class="sr-only">Sort memories</span><select id="memorySort"><option value="recent">Recently updated</option><option value="oldest">Oldest first</option><option value="priority">Highest priority</option><option value="alphabetical">Alphabetical</option></select></label></div>
+            <div class="memory-summary"><span id="memoryResultCount">Loading memories…</span><span class="muted">Memories are private to this account</span></div><div class="memory-list" id="memoryList" aria-live="polite"></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-timeline" aria-labelledby="pageTitle" hidden>
+          <div class="panel timeline-panel"><div class="panel-head"><div><span class="section-kicker">A RECORD OF CHANGE</span><h2>Memory timeline</h2><p class="panel-intro">Version timestamps and lifecycle actions recorded by this application.</p></div><button class="button quiet" id="refreshTimeline">↻ Refresh</button></div><div class="notice warm-notice"><span>i</span><p>Older memory versions are available from their version records. Delete and recovery events are recorded from the point this event log was introduced; earlier such events cannot be reconstructed.</p></div><div class="timeline" id="timelineList" aria-live="polite"></div></div>
+        </section>
+
+        <section class="view" id="view-analytics" aria-labelledby="pageTitle" hidden>
+          <div class="analytics-grid" id="analyticsGrid" aria-live="polite"><div class="panel loading-card">Loading account metrics…</div></div>
+          <div class="panel analytics-note"><span class="section-kicker">HOW TO READ THIS</span><p>These totals come from records stored for your account. This view does not claim model quality, retrieval accuracy, or token savings. The repository's small synthetic evaluation is separate and is not a measure of your usage.</p></div>
+        </section>
+
+        <section class="view" id="view-settings" aria-labelledby="pageTitle" hidden>
+          <div class="settings-grid"><div class="panel settings-panel"><span class="section-kicker">MODEL CONFIGURATION</span><h2>How responses are generated</h2><p class="panel-intro">Memory Atlas uses the provider configured on the server. The browser never receives provider secrets.</p><div class="setting-row"><div><strong>Active provider</strong><span id="settingsProvider">Loading…</span></div><span id="settingsProviderBadge" class="provider-pill">—</span></div><div class="setting-row"><div><strong>Model</strong><span id="settingsModel">Loading…</span></div></div><div class="notice" id="providerNotice"></div><div class="settings-help"><h3>Local Ollama</h3><p>Set <code>MODEL_PROVIDER=ollama</code>, <code>OLLAMA_URL</code>, and <code>OLLAMA_MODEL</code> in the server environment, install a model separately, then restart the API. No model is downloaded automatically.</p><p>In deterministic mode, responses are labeled development output and are not LLM-generated.</p></div></div>
+            <div class="panel settings-panel"><span class="section-kicker">PRIVACY & CONTROL</span><h2>Your memory, your call.</h2><div class="about-list"><div><b>01</b><p><strong>Account isolation</strong><br>Memory routes require authentication and filter by the signed-in account.</p></div><div><b>02</b><p><strong>Reversible deletion</strong><br>Deleted memories can be recovered. Permanent removal requires explicit confirmation.</p></div><div><b>03</b><p><strong>Version history</strong><br>Edits and restores append a new version rather than silently replacing history.</p></div></div><div class="notice warm-notice"><span>!</span><p>With Groq configured, your current message, selected recent messages, an extractive summary of recent user messages in longer chats, and up to three matching active memories may be sent to the provider. Some messages may also be sent alone for memory analysis. Avoid secrets or sensitive personal information.</p></div><p class="muted small-copy">Local proof of concept. Not production security; review hosting, session storage, encryption, backups, and rate limits before public deployment.</p></div></div>
+        </section>
+        <footer class="workspace-footer"><span>MEMORY ATLAS</span><span>Context, kept with intention.</span></footer>
+      </div>
+    </main>
+  </div>
+  <dialog class="dialog" id="conversationRenameDialog" aria-labelledby="conversationRenameTitle">
+    <form id="conversationRenameForm" method="dialog">
+      <div class="dialog-head"><div><span class="section-kicker">CONVERSATION</span><h2 id="conversationRenameTitle">Rename chat</h2></div><button class="icon-button" value="cancel" aria-label="Close">×</button></div>
+      <label for="conversationTitleInput">Title</label><input id="conversationTitleInput" maxlength="80" required>
+      <p class="form-message" id="conversationRenameMessage" role="status"></p>
+      <div class="dialog-actions"><button class="button quiet" value="cancel">Cancel</button><button class="button primary" id="saveConversationTitle" type="submit" value="save">Save title</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="memoryDialog" aria-labelledby="memoryDialogTitle"><form method="dialog" id="memoryForm" class="modal-card"><div class="modal-head"><div><span class="section-kicker">MEMORY CONTROL</span><h2 id="memoryDialogTitle">Add a memory</h2></div><button class="icon-button close-dialog" value="cancel" aria-label="Close dialog">×</button></div><input type="hidden" id="editMemoryId"><label for="memoryContent">Memory content</label><textarea id="memoryContent" rows="4" maxlength="2000" required placeholder="Write one useful, durable detail…"></textarea><div class="field-row"><label>Category<select id="memoryCategoryInput"><option value="fact">Fact</option><option value="preference">Preference</option><option value="goal">Goal</option><option value="project">Project</option></select></label><label>Priority<select id="memoryPriority"><option value="1">1 · Low</option><option value="2">2</option><option value="3" selected>3 · Normal</option><option value="4">4</option><option value="5">5 · High</option></select></label></div><p class="form-message" id="memoryFormMessage" role="status"></p><div class="modal-actions"><button class="button quiet close-dialog" value="cancel">Cancel</button><button class="button primary" id="saveMemory" type="submit" value="save">Save memory</button></div></form></dialog>
+  <dialog class="modal" id="actionDialog" aria-labelledby="actionDialogTitle"><form method="dialog" id="actionForm" class="modal-card"><div class="modal-head"><div><span class="section-kicker" id="actionEyebrow">CONFIRM ACTION</span><h2 id="actionDialogTitle">Are you sure?</h2></div><button class="icon-button close-dialog" value="cancel" aria-label="Close dialog">×</button></div><p id="actionDescription"></p><label id="confirmationLabel" for="confirmationInput" hidden>Type <code>PERMANENTLY DELETE</code> to confirm</label><input id="confirmationInput" autocomplete="off" hidden><div class="modal-actions"><button class="button quiet close-dialog" value="cancel">Cancel</button><button class="button danger" id="confirmAction" type="submit" value="confirm">Confirm</button></div></form></dialog>
+  <dialog class="modal history-modal" id="historyDialog" aria-labelledby="historyTitle"><div class="modal-card"><div class="modal-head"><div><span class="section-kicker">APPENDED VERSIONS</span><h2 id="historyTitle">Memory history</h2></div><button class="icon-button" id="closeHistory" aria-label="Close dialog">×</button></div><div id="historyVersions"></div></div></dialog>
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+  <script src="/static/vendor/marked-18.0.14.min.js" defer></script>
+  <script src="/static/vendor/dompurify-3.4.17.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
