@@ -17,7 +17,7 @@ services:
       - key: APP_ENV
         value: production
       - key: DEMO_INVITATIONS_REQUIRED
-        value: "true"
+        value: "false"
       - key: DATABASE_PATH
         value: /var/data/memory-atlas-demo.sqlite3
       - key: MODEL_PROVIDER
