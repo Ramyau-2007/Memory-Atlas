@@ -46,12 +46,16 @@
         <div class="auth-card">
           <div class="eyebrow">A QUIETER KIND OF INTELLIGENCE</div>
           <h1>Your context,<br><em>thoughtfully kept.</em></h1>
-          <p>Sign in to explore a private memory space that keeps useful context close and gives you control over what stays.</p>
-          <form id="authForm" class="auth-form">
+          <p>Sign in to explore your private memory space, or create an account to get started.</p>
+          <div class="auth-choice" id="authChoice" aria-label="Choose an account action">
+            <button class="button primary" id="chooseRegister" type="button">Create New Account</button>
+            <button class="button quiet" id="chooseLogin" type="button">Already have an account? Sign In</button>
+          </div>
+          <form id="authForm" class="auth-form" hidden>
             <label for="username">Username</label><input id="username" name="username" autocomplete="username" minlength="3" maxlength="64" required>
             <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" minlength="10" maxlength="256" required>
             <div id="invitationField" hidden><label for="invitationCode">Demo invitation code</label><input id="invitationCode" name="invitation_code" autocomplete="one-time-code" maxlength="160" aria-describedby="invitationHelp"><small id="invitationHelp">A one-time code from the demo organizer is required to create an account.</small></div>
-            <div class="auth-actions"><button class="button primary" type="submit" data-auth="login">Sign in <span aria-hidden="true">→</span></button><button class="button quiet" type="submit" data-auth="register">Create account</button></div>
+            <div class="auth-actions"><button class="button primary" id="authSubmit" type="submit">Sign In</button><button class="button quiet" id="authSwitch" type="button">Create New Account</button></div>
           </form>
           <p class="form-message" id="authMessage" role="status" aria-live="polite"></p>
           <p class="privacy-disclosure"><strong>Demo privacy:</strong> When Groq is enabled, your current message, selected recent messages, an extractive summary of recent user messages in longer chats, and up to three matching active memories may be sent to Groq. Some messages may also be sent alone for memory analysis. Avoid passwords, secrets, or sensitive personal information. Demo data remains stored until deleted or the demo is cleaned up.</p>

@@ -12,6 +12,7 @@ let actionHandler = null;
 let toastTimer;
 let messageEditPending = false;
 let invitationRequired = false;
+let authMode = null;
 
 const byId = (id) => document.getElementById(id);
 // This element is moved in and out of #messages as conversations are switched.
@@ -82,9 +83,11 @@ async function auth(kind) {
         return;
       }
       await api('/register', { method: 'POST', body: JSON.stringify({ username, password, invitation_code: invitationCode || null }) });
-      message.textContent = 'Account created. Sign in with your new credentials.';
       byId('password').value = '';
       byId('invitationCode').value = '';
+      setAuthMode('login');
+      message.textContent = 'Account created. Sign in with your new credentials.';
+      byId('username').focus();
       return;
     }
     const result = await api('/login', { method: 'POST', body: JSON.stringify({ username, password }) });
@@ -95,9 +98,23 @@ async function auth(kind) {
   } catch (error) { message.textContent = error.message; }
 }
 
+function setAuthMode(mode) {
+  authMode = mode;
+  byId('authChoice').hidden = true;
+  byId('authForm').hidden = false;
+  byId('authSubmit').textContent = mode === 'register' ? 'Create New Account' : 'Sign In';
+  byId('authSwitch').textContent = mode === 'register' ? 'Already have an account? Sign In' : 'Create New Account';
+  byId('password').autocomplete = mode === 'register' ? 'new-password' : 'current-password';
+  byId('authMessage').textContent = '';
+  byId('username').focus();
+}
+
+byId('chooseRegister').addEventListener('click', () => setAuthMode('register'));
+byId('chooseLogin').addEventListener('click', () => setAuthMode('login'));
+byId('authSwitch').addEventListener('click', () => setAuthMode(authMode === 'register' ? 'login' : 'register'));
 byId('authForm').addEventListener('submit', (event) => {
   event.preventDefault();
-  auth(event.submitter?.dataset.auth || 'login');
+  auth(authMode || 'login');
 });
 
 async function showWorkspace() {

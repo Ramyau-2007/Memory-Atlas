@@ -52,6 +52,23 @@ class FrontendRenderingTests(unittest.TestCase):
         self.assertIn('*.sqlite3',ignore)
         self.assertIn('*.db',ignore)
 
+    def test_welcome_page_has_distinct_account_choices_and_switching(self):
+        html=(ROOT/'static'/'index.html').read_text(encoding='utf-8')
+        script=(ROOT/'static'/'app.js').read_text(encoding='utf-8')
+        self.assertIn('Create New Account',html)
+        self.assertIn('Already have an account? Sign In',html)
+        self.assertIn("byId('chooseRegister').addEventListener",script)
+        self.assertIn("byId('chooseLogin').addEventListener",script)
+        self.assertIn("authMode || 'login'",script)
+        self.assertIn("mode === 'register' ? 'new-password' : 'current-password'",script)
+
+    def test_auth_layout_has_desktop_and_mobile_breakpoints(self):
+        styles=(ROOT/'static'/'style.css').read_text(encoding='utf-8')
+        self.assertIn('.auth-choice .button { width: 100%;',styles)
+        self.assertIn('@media (max-width: 820px)',styles)
+        self.assertIn('@media (max-width: 560px)',styles)
+        self.assertIn('min-height: calc(100dvh - 56px)',styles)
+
 
 if __name__ == '__main__':
     unittest.main()

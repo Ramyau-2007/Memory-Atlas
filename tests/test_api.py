@@ -443,6 +443,34 @@ class ApiWorkflowTests(unittest.TestCase):
         with database.connect(self.db_path) as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM memory_versions WHERE memory_id=?', (memory_id,)).fetchone()[0], 0)
 
+    def test_registration_rejects_duplicates_and_second_browser_recovers_history(self):
+        duplicate = self.client.post('/api/register', json={
+            'username': 'alice', 'password': 'a-long-test-password'
+        })
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertIn('already registered', duplicate.json()['detail'])
+
+        created = self.client.post('/api/conversations', headers=self.alice, json={'title': 'Across devices'})
+        conversation_id = created.json()['id']
+        chat = self._chat_without_provider(self.alice, {
+            'message': 'Keep this history for my other browser', 'conversation_id': conversation_id
+        })
+        self.assertEqual(chat.status_code, 200, chat.text)
+        expected = self.client.get(f'/api/conversations/{conversation_id}/messages', headers=self.alice).json()
+
+        with TestClient(app) as second_browser:
+            signed_in = second_browser.post('/api/login', json={
+                'username': 'alice', 'password': 'a-long-test-password'
+            })
+            self.assertEqual(signed_in.status_code, 200, signed_in.text)
+            other_session = {'Authorization': 'Bearer ' + signed_in.json()['token']}
+            listing = second_browser.get('/api/conversations', headers=other_session)
+            self.assertEqual(listing.status_code, 200, listing.text)
+            self.assertTrue(any(item['id'] == conversation_id for item in listing.json()))
+            actual = second_browser.get(f'/api/conversations/{conversation_id}/messages', headers=other_session)
+            self.assertEqual(actual.status_code, 200, actual.text)
+            self.assertEqual(actual.json(), expected)
+
     def test_memory_and_session_persist_after_app_restart(self):
         self.client.post('/api/memories', headers=self.alice, json={
             'content': 'Persistent note', 'category': 'fact', 'priority': 2

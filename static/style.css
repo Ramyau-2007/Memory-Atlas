@@ -146,6 +146,8 @@ select option { color: var(--text); background: var(--surface); }
 .auth-card h1 { margin: 10px 0 14px; font-size: clamp(38px, 5vw, 57px); line-height: 1.03; letter-spacing: -.055em; }
 .auth-card h1 em { color: var(--violet-light); font-family: Georgia, serif; font-weight: 500; }
 .auth-card > p { color: var(--muted); }
+.auth-choice { display: grid; gap: 10px; margin-top: 24px; }
+.auth-choice .button { width: 100%; min-height: 48px; justify-content: center; font-size: 14px; }
 .auth-form { display: grid; gap: 8px; margin-top: 24px; }
 .auth-form label, .modal-card > label { margin-top: 6px; color: #D5D9F0; font-size: 11px; font-weight: 650; }
 .auth-actions, .modal-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 9px; }
@@ -370,7 +372,7 @@ code { border: 1px solid rgb(155 123 255 / 25%); border-radius: 4px; padding: 1p
   .workspace { padding: 27px 18px 18px; }.page-heading { align-items: flex-start; }
   .chat-layout, .universe-layout, .settings-grid { grid-template-columns: 1fr; }
   .conversation-panel { min-height: 530px; }.inspector { min-height: 220px; }
-  .auth-wrap { grid-template-columns: minmax(0, 440px); padding: 35px 24px; }.auth-aside { min-height: 230px; }.aside-copy { margin-top: 110px; }
+  .auth-wrap { grid-template-columns: minmax(0, 440px); padding: 35px 24px; }.auth-aside { display: none; }.aside-copy { margin-top: 110px; }
 }
 @media (max-width: 560px) {
   .topbar { height: 56px; }.provider-pill { max-width: 145px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
@@ -381,7 +383,7 @@ code { border: 1px solid rgb(155 123 255 / 25%); border-radius: 4px; padding: 1p
   .graph-wrap { overflow-x: auto; }.graph-wrap #memoryGraph { min-width: 500px; min-height: 0; }
   .analytics-grid { gap: 8px; }.stat-card { min-height: 112px; padding: 12px; }.stat-card strong { font-size: 27px; }
   .chat-message { max-width: 96%; }.conversation-panel { min-height: 500px; padding: 14px; }
-  .field-row { grid-template-columns: 1fr; }.auth-card h1 { font-size: 42px; }
+  .field-row { grid-template-columns: 1fr; }.auth-card h1 { font-size: 42px; }.auth-wrap { min-height: calc(100dvh - 56px); padding: 28px 16px; }.auth-card { width: 100%; }.auth-choice .button { min-height: 50px; }
   .workspace-footer { font-size: 9px; }.workspace-footer span:last-child { text-align: right; }
   .chat-history { max-height: 27vh; }
 }
