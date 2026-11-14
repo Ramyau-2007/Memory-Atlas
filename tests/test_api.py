@@ -14,6 +14,112 @@ from app.invitations import create_invitation, disable_account, enable_account
 
 
 class ApiWorkflowTests(unittest.TestCase):
+    # Existing setUp/tearDown remain unchanged
+    # -------------------------------------------------------------------
+    # Added authentication‑security tests (Phase 2)
+    # -------------------------------------------------------------------
+    def test_password_is_hashed_and_not_stored_in_plaintext(self):
+        """Register a new user and verify the stored password hash.
+
+        - The hash must contain a ':' separating salt and digest.
+        - Salt should be 32 hex characters (16‑byte random value).
+        - Digest should be 64 hex characters (32‑byte PBKDF2 output).
+        - The original password must never appear in the stored value.
+        """
+        # Register a fresh user (different from alice/bob)
+        username = 'charlie'
+        password = 'a-very-long-secure-password'
+        resp = self.client.post('/api/register', json={'username': username, 'password': password})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        # Inspect the DB directly using the isolated test database
+        import app.db as db_mod
+        with db_mod.connect(self.db_path) as con:
+            row = con.execute('SELECT password_hash FROM users WHERE username=?', (username,)).fetchone()
+        self.assertIsNotNone(row, 'User not found in DB')
+        stored = row['password_hash']
+        # Ensure we do not store the raw password
+        self.assertNotIn(password, stored)
+        # Verify format "salt:hash"
+        self.assertIn(':', stored)
+        salt, digest = stored.split(':', 1)
+        self.assertRegex(salt, r'^[0-9a-f]{32}$', 'Salt length/pattern mismatch')
+        self.assertRegex(digest, r'^[0-9a-f]{64}$', 'Digest length/pattern mismatch')
+
+    def test_expired_session_is_rejected(self):
+        """Create a session, artificially expire it, and confirm auth failure."""
+        # Login as alice to obtain a token
+        login_resp = self.client.post('/api/login', json={'username': 'alice', 'password': 'a-long-test-password'})
+        self.assertEqual(login_resp.status_code, 200)
+        token = login_resp.json()['token']
+        # Expire the session in the DB
+        import app.db as db_mod
+        from datetime import datetime, timezone, timedelta
+        past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with db_mod.connect(self.db_path) as con:
+            con.execute('UPDATE sessions SET expires_at=? WHERE token_hash=?',
+                        (past, __import__('hashlib').sha256(token.encode()).hexdigest()))
+        # Any authenticated request should now be rejected
+        auth_header = {'Authorization': f'Bearer {token}'}
+        self.assertEqual(self.client.get('/api/memories', headers=auth_header).status_code, 401)
+        self.assertEqual(self.client.get('/api/conversations', headers=auth_header).status_code, 401)
+
+    def test_cross_user_id_tampering_is_blocked(self):
+        """Ensure a user cannot modify another user's resources via ID spoofing."""
+        # Alice creates a conversation and a memory
+        conv_resp = self.client.post('/api/conversations', headers=self.alice, json={'title': 'Alice Conv'})
+        self.assertEqual(conv_resp.status_code, 200)
+        conv_id = conv_resp.json()['id']
+        mem_resp = self.client.post('/api/memories', headers=self.alice,
+                                    json={'content': 'Alice secret', 'category': 'fact', 'priority': 1})
+        self.assertEqual(mem_resp.status_code, 200)
+        mem_id = mem_resp.json()['id']
+        # Bob attempts to tamper with Alice's conversation
+        # PATCH title
+        self.assertEqual(self.client.patch(f'/api/conversations/{conv_id}',
+                                            headers=self.bob, json={'title': 'Hijacked'}).status_code, 404)
+        # DELETE conversation
+        self.assertEqual(self.client.delete(f'/api/conversations/{conv_id}',
+                                            headers=self.bob).status_code, 404)
+        # Bob attempts to modify Alice's memory via PATCH, DELETE, PERMANENT DELETE, RESTORE, VERSION actions
+        self.assertEqual(self.client.patch(f'/api/memories/{mem_id}',
+                                            headers=self.bob, json={'content': 'hacked', 'category': 'fact', 'priority': 1}).status_code, 404)
+        self.assertEqual(self.client.delete(f'/api/memories/{mem_id}',
+                                            headers=self.bob).status_code, 404)
+        # Soft‑deleted version actions (recover, permanent delete, version restore) should also be blocked
+        self.assertEqual(self.client.post(f'/api/memories/{mem_id}/recover', headers=self.bob).status_code, 404)
+        self.assertEqual(self.client.request('DELETE', f'/api/memories/{mem_id}/permanent', headers=self.bob, json={'confirmation': 'PERMANENTLY DELETE'}).status_code, 404)
+        self.assertEqual(self.client.post(f'/api/memories/{mem_id}/restore/1', headers=self.bob).status_code, 404)
+        self.assertEqual(self.client.get(f'/api/memories/{mem_id}/versions', headers=self.bob).status_code, 404)
+
+    def test_malformed_authorization_headers(self):
+        """Invalid Authorization headers must not authenticate the request."""
+        # Valid token for control
+        valid = self.alice
+        # 1. Missing scheme
+        hdr1 = {'Authorization': f'{self.alice["Authorization"].split(" ",1)[1]}' }  # just token
+        self.assertEqual(self.client.get('/api/memories', headers=hdr1).status_code, 401)
+        # 2. Wrong scheme
+        hdr2 = {'Authorization': f'Basic {self.alice["Authorization"].split()[1]}' }
+        self.assertEqual(self.client.get('/api/memories', headers=hdr2).status_code, 401)
+        # 3. Malformed Bearer (no space)
+        hdr3 = {'Authorization': f'Bearer{self.alice["Authorization"].split()[1]}' }
+        self.assertEqual(self.client.get('/api/memories', headers=hdr3).status_code, 401)
+        # 4. Empty token after Bearer
+        hdr4 = {'Authorization': 'Bearer '}
+        self.assertEqual(self.client.get('/api/memories', headers=hdr4).status_code, 401)
+        # Ensure a proper request still works
+        self.assertEqual(self.client.get('/api/memories', headers=valid).status_code, 200)
+
+    def test_session_tokens_are_unique(self):
+        """Each login should produce a distinct session token (no accidental reuse)."""
+        # Register a third user to get a second token
+        username = 'dave'
+        password = 'another-long-password'
+        self.client.post('/api/register', json={'username': username, 'password': password})
+        token1 = self.client.post('/api/login', json={'username': 'alice', 'password': 'a-long-test-password'}).json()['token']
+        token2 = self.client.post('/api/login', json={'username': username, 'password': password}).json()['token']
+        self.assertNotEqual(token1, token2, 'Two independent logins produced the same token')
+
     def setUp(self):
         request_limiter.clear()
         model_usage_guard.clear()
