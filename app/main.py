@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 import json
+import logging
 import os
 from pathlib import Path
 from time import perf_counter
@@ -7,7 +8,7 @@ from fastapi import FastAPI, Depends, HTTPException, Response, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from .db import init_db, connect
+from .db import DATABASE_PATH, init_db, connect, validate_existing_database
 from .auth import register, login, current_user, revoke
 from .invitations import invitations_required
 from . import memory
@@ -17,11 +18,25 @@ from .security import (
     env_flag, limit_request, model_usage_guard,
 )
 
+logger = logging.getLogger(__name__)
+
 @asynccontextmanager
 async def lifespan(app):
-    if (os.getenv("APP_ENV", "development").strip().lower() == "production"
+    production = os.getenv("APP_ENV", "development").strip().lower() == "production"
+    if (production
             and env_flag("SESSION_COOKIE_AUTH") and not env_flag("SESSION_COOKIE_SECURE")):
         raise RuntimeError("SESSION_COOKIE_SECURE must be enabled when cookie authentication is used in production.")
+    if production:
+        db_target, db_metric = validate_existing_database()
+        if db_target == "postgresql":
+            logger.info("Production PostgreSQL database validated: user_count=%d", db_metric)
+        else:
+            if not Path(DATABASE_PATH).is_absolute():
+                logger.warning(
+                    "Production DATABASE_PATH is relative (resolved=%s); filesystem durability "
+                    "depends on the hosting provider.", db_target)
+            logger.info("Production SQLite database validated: path=%s size_bytes=%d",
+                        db_target, db_metric)
     init_db()
     yield
 
@@ -274,42 +289,63 @@ def api_restore(mid:int,version:int,user:int=Depends(owner)):
 @app.post("/api/chat",dependencies=[Depends(limit_request("chat","CHAT_RATE_LIMIT","CHAT_RATE_WINDOW_SECONDS",20,60))])
 def api_chat(body:ChatInput,user:int=Depends(owner)):
     adapter=ModelAdapter()
-    if body.conversation_id is not None:
+    cid=body.conversation_id
+    if cid is None:
+        recent=[]
+        summary=""
+    else:
         with connect() as db:
-            if not db.execute("SELECT 1 FROM conversations WHERE id=? AND user_id=?",(body.conversation_id,user)).fetchone():
+            conversation=db.execute(
+                "SELECT id,summary FROM conversations WHERE id=? AND user_id=?",(cid,user)
+            ).fetchone()
+            if not conversation:
                 raise HTTPException(404,"Conversation not found.")
+            recent=[dict(row) for row in db.execute(
+                "SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 4",(cid,)
+            ).fetchall()][::-1]
+            summary=conversation["summary"]
+            if summary:
+                recent=[{"role":"system","content":summary},*recent[-2:]]
     usage_reserved=adapter.provider=="groq"
     if usage_reserved:
         try: app.state.model_usage_guard.reserve(user)
         except ModelUsageLimitExceeded as exc:
             raise HTTPException(429,str(exc),headers={"Retry-After":str(exc.retry_after)}) from exc
+    # Generate before persisting either message. Provider failures therefore
+    # leave existing history intact and do not create an empty new conversation.
+    result=generate_chat_result(user,body.message,recent,adapter=adapter,usage_reserved=usage_reserved)
+    decision=result["decision"]
     with connect() as db:
-        if body.conversation_id is not None:
-            conv=db.execute("SELECT id FROM conversations WHERE id=? AND user_id=?",(body.conversation_id,user)).fetchone()
-            if not conv: raise HTTPException(404,"Conversation not found.")
-            cid=body.conversation_id
+        if cid is None:
+            cid=db.execute("INSERT INTO conversations(user_id,title) VALUES(?,?)",
+                           (user,conversation_title(body.message))).lastrowid
         else:
-            cid=db.execute("INSERT INTO conversations(user_id,title) VALUES(?,?)",(user,conversation_title(body.message))).lastrowid
+            conversation=db.execute("SELECT id FROM conversations WHERE id=? AND user_id=?",(cid,user)).fetchone()
+            if not conversation:
+                raise HTTPException(404,"Conversation not found.")
         title_row=db.execute("SELECT title FROM conversations WHERE id=? AND user_id=?",(cid,user)).fetchone()
         if title_row and title_row["title"]=="New chat" and not db.execute(
             "SELECT 1 FROM messages WHERE conversation_id=? LIMIT 1",(cid,)
         ).fetchone():
-            db.execute("UPDATE conversations SET title=? WHERE id=? AND user_id=?",(conversation_title(body.message),cid,user))
-        recent=[dict(x) for x in db.execute("SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 4",(cid,)).fetchall()][::-1]
-        message_id=db.execute("INSERT INTO messages(conversation_id,role,content) VALUES(?,?,?)",(cid,"user",body.message)).lastrowid
+            db.execute("UPDATE conversations SET title=? WHERE id=? AND user_id=?",
+                       (conversation_title(body.message),cid,user))
+        message_id=db.execute("INSERT INTO messages(conversation_id,role,content) VALUES(?,?,?)",
+                              (cid,"user",body.message)).lastrowid
         message_count=db.execute("SELECT COUNT(*) FROM messages WHERE conversation_id=?",(cid,)).fetchone()[0]
-        summary_row=db.execute("SELECT summary FROM conversations WHERE id=?",(cid,)).fetchone()
-        summary=summary_row["summary"] if summary_row else ""
         if message_count >= 8:
-            user_turns=[x[0] for x in db.execute("SELECT content FROM messages WHERE conversation_id=? AND role='user' ORDER BY id DESC LIMIT 8",(cid,)).fetchall()][::-1]
-            summary="Extractive conversation summary (recent user turns): " + " | ".join(x[:180] for x in user_turns)
+            user_turns=[row[0] for row in db.execute(
+                "SELECT content FROM messages WHERE conversation_id=? AND role='user' ORDER BY id DESC LIMIT 8",
+                (cid,)
+            ).fetchall()][::-1]
+            summary="Extractive conversation summary (recent user turns): " + " | ".join(text[:180] for text in user_turns)
             db.execute("UPDATE conversations SET summary=? WHERE id=?",(summary[:1600],cid))
-        if summary: recent=[{"role":"system","content":summary},*recent[-2:]]
-    result=generate_chat_result(user,body.message,recent,adapter=adapter,usage_reserved=usage_reserved)
-    decision=result["decision"]
-    with connect() as db: db.execute("INSERT INTO messages(conversation_id,role,content) VALUES(?,?,?)",(cid,"assistant",result["answer"]))
-    if decision["retain"]: memory.add_memory(user,decision["content"],decision["category"],decision["priority"],decision["reason"],source_message_id=message_id)
-    else: memory.add_temporary(user,body.message)
+        db.execute("INSERT INTO messages(conversation_id,role,content) VALUES(?,?,?)",
+                   (cid,"assistant",result["answer"]))
+        if decision["retain"]:
+            memory.add_memory_record(db,user,decision["content"],decision["category"],decision["priority"],
+                                     decision["reason"],source_message_id=message_id)
+    if not decision["retain"]:
+        memory.add_temporary(user,body.message)
     return chat_response_payload(result,body.message,cid,int(message_id))
 @app.get("/api/health")
 def health():

@@ -35,8 +35,17 @@ def register(username: str, password: str, db_path: str | None = None,
     except HTTPException:
         raise
     except Exception as exc:
+        # SQLite: check for generic UNIQUE constraint violation message
         if "UNIQUE" in str(exc):
             raise HTTPException(409, "That username is already registered.") from exc
+        # PostgreSQL (via SQLAlchemy) raises IntegrityError with pgcode 23505
+        try:
+            from sqlalchemy.exc import IntegrityError
+            if isinstance(exc, IntegrityError) and getattr(exc.orig, "pgcode", None) == "23505":
+                raise HTTPException(409, "That username is already registered.") from exc
+        except ImportError:
+            pass
+        # Propagate other exceptions unchanged
         raise
 
 def login(username: str, password: str, db_path: str | None = None) -> str:

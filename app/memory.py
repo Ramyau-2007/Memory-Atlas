@@ -1,8 +1,11 @@
+import logging
+import math
 import re
 import sqlite3
-import math
 from datetime import datetime, timedelta, timezone
 from .db import connect
+
+logger = logging.getLogger(__name__)
 
 RETRIEVAL_STOP_WORDS={
     "the","user","which","what","who","where","when","why","how","does","do","did",
@@ -184,50 +187,127 @@ def list_memories(user_id: int, query: str = "", include_deleted: bool = False, 
     sql += " ORDER BY priority DESC,updated_at DESC"
     with connect(db_path) as db: return [dict(x) for x in db.execute(sql,params).fetchall()]
 
+def _extract_sqlstate(exc: Exception) -> str | None:
+    """Extract 5-character PostgreSQL SQLSTATE code from SQLAlchemy or pg8000 exception."""
+    if hasattr(exc, "sqlstate") and exc.sqlstate:
+        return str(exc.sqlstate)
+    if hasattr(exc, "pgcode") and exc.pgcode:
+        return str(exc.pgcode)
+    orig = getattr(exc, "orig", None)
+    if orig:
+        if hasattr(orig, "sqlstate") and orig.sqlstate:
+            return str(orig.sqlstate)
+        if hasattr(orig, "pgcode") and orig.pgcode:
+            return str(orig.pgcode)
+        if hasattr(orig, "args") and orig.args and isinstance(orig.args[0], dict):
+            code = orig.args[0].get("C")
+            if code:
+                return str(code)
+    if hasattr(exc, "args") and exc.args and isinstance(exc.args[0], dict):
+        code = exc.args[0].get("C")
+        if code:
+            return str(code)
+    return None
+
+
 def retrieve(user_id: int, query: str, limit: int = 5, db_path: str | None = None,
              search_terms: list[str] | None = None, exclude_ids: set[int] | list[int] | None = None) -> list[dict]:
-    terms=set(re.findall(r"[a-z0-9]{3,}",query.lower()))
+    terms = set(re.findall(r"[a-z0-9]{3,}", query.lower()))
     for expanded in (search_terms or [])[:12]:
-        terms.update(re.findall(r"[a-z0-9]{3,}",expanded.lower()))
+        terms.update(re.findall(r"[a-z0-9]{3,}", expanded.lower()))
     terms.difference_update(RETRIEVAL_STOP_WORDS)
-    if not terms or limit<=0: return []
-    candidates=[]
-    # FTS5 expands the candidate set across tokenized query terms and ranks
-    # longer, rarer matches. Owner and lifecycle filters remain SQL-enforced.
-    fts_expression=" OR ".join(f'"{term}"' for term in sorted(terms))
-    try:
-        with connect(db_path) as db:
-            candidates=[dict(row) for row in db.execute(
-                "SELECT m.*,bm25(memory_search_fts,5.0,1.0) AS fts_rank "
-                "FROM memory_search_fts JOIN memories m ON m.id=memory_search_fts.rowid "
-                "WHERE memory_search_fts MATCH ? AND memory_search_fts.owner_id=? "
-                "AND m.user_id=? AND m.deleted_at IS NULL AND m.temporary=0 "
-                "ORDER BY fts_rank ASC LIMIT ?",
-                (fts_expression,user_id,user_id,max(50,limit*10)),
-            ).fetchall()]
-    except sqlite3.OperationalError as exc:
-        # Keep compatibility with SQLite builds without FTS5 or databases
-        # initialized before the optional index was added.
-        message=str(exc).lower()
-        if "no such module: fts5" not in message and "no such table: memory_search_fts" not in message: raise
+    if not terms or limit <= 0:
+        return []
+
+    candidates = []
+    is_postgres = False
+
+    with connect(db_path) as db:
+        is_postgres = getattr(db, "is_postgres", False)
+        if is_postgres:
+            clean_terms = [re.sub(r"[^\w]", "", t) for t in sorted(terms) if re.sub(r"[^\w]", "", t)]
+            if clean_terms:
+                ts_query = " | ".join(f"{t}:*" for t in clean_terms)
+                try:
+                    candidates = [dict(row) for row in db.execute(
+                        "SELECT m.*, ts_rank_cd(to_tsvector('english', m.content || ' ' || m.category), to_tsquery('english', ?)) AS fts_rank "
+                        "FROM memories m "
+                        "WHERE to_tsvector('english', m.content || ' ' || m.category) @@ to_tsquery('english', ?) "
+                        "AND m.user_id=? AND m.deleted_at IS NULL AND m.temporary=0 "
+                        "ORDER BY fts_rank DESC LIMIT ?",
+                        (ts_query, ts_query, user_id, max(50, limit * 10)),
+                    ).fetchall()]
+                except Exception as exc:
+                    sqlstate = _extract_sqlstate(exc)
+                    err_msg = str(exc).lower()
+                    # Expected SQLSTATE codes for text search / tsquery errors:
+                    # 42601: syntax_error (malformed tsquery expression)
+                    # 22023: invalid_parameter_value (invalid tsquery parameter)
+                    # 42883: undefined_function
+                    # 42P01: undefined_table
+                    expected_sqlstates = {"42601", "22023", "42883", "42P01"}
+                    is_expected = (sqlstate in expected_sqlstates) or any(
+                        s in err_msg for s in (
+                            "syntax error in tsquery",
+                            "query contains only stop words",
+                            "no such function",
+                            "no such table",
+                        )
+                    )
+                    if is_expected:
+                        logger.warning(
+                            "Expected PostgreSQL full-text search error (SQLSTATE=%s) for query %r: %s",
+                            sqlstate, query, exc,
+                        )
+                        candidates = []
+                    else:
+                        logger.error(
+                            "Unexpected database error during PostgreSQL full-text search (SQLSTATE=%s): %s",
+                            sqlstate, exc, exc_info=True,
+                        )
+                        raise
+        else:
+            fts_expression = " OR ".join(f'"{term}"' for term in sorted(terms))
+            try:
+                candidates = [dict(row) for row in db.execute(
+                    "SELECT m.*, bm25(memory_search_fts, 5.0, 1.0) AS fts_rank "
+                    "FROM memory_search_fts JOIN memories m ON m.id=memory_search_fts.rowid "
+                    "WHERE memory_search_fts MATCH ? AND memory_search_fts.owner_id=? "
+                    "AND m.user_id=? AND m.deleted_at IS NULL AND m.temporary=0 "
+                    "ORDER BY fts_rank ASC LIMIT ?",
+                    (fts_expression, user_id, user_id, max(50, limit * 10)),
+                ).fetchall()]
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "no such module: fts5" not in message and "no such table: memory_search_fts" not in message:
+                    logger.error("Unexpected SQLite FTS error: %s", exc, exc_info=True)
+                    raise
+                logger.warning("SQLite FTS5 unavailable (%s); falling back to lexical search.", exc)
+
     if not candidates:
-        candidates=list_memories(user_id,db_path=db_path)
-    candidates=[item for item in candidates if not item["temporary"] and item['id'] not in (exclude_ids or ())]
-    fts_order={item['id']:index for index,item in enumerate(candidates) if 'fts_rank' in item}
-    ranked=[]
+        candidates = list_memories(user_id, db_path=db_path)
+
+    candidates = [item for item in candidates if not item["temporary"] and item['id'] not in (exclude_ids or ())]
+    fts_order = {item['id']: index for index, item in enumerate(candidates) if 'fts_rank' in item}
+    fts_label = "PostgreSQL FTS" if is_postgres else "FTS5"
+    ranked = []
+
     for item in candidates:
-        words=set(re.findall(r"[a-z0-9]{3,}",(item["content"]+" "+item["category"]).lower()))
-        overlap=len(terms & words)
-        fts_index=fts_order.get(item['id'])
+        words = set(re.findall(r"[a-z0-9]{3,}", (item["content"] + " " + item["category"]).lower()))
+        overlap = len(terms & words)
+        fts_index = fts_order.get(item['id'])
         if overlap or fts_index is not None:
-            lexical_score=overlap/max(1,math.sqrt(len(terms)))
-            fts_score=(1-fts_index/max(1,len(fts_order))) if fts_index is not None else 0
-            score=lexical_score+0.35*fts_score+item["priority"]*0.025
-            reason=(f"Shares {overlap} query keyword(s); "
-                    +(f"FTS5 result rank {fts_index+1}; " if fts_index is not None else "lexical match; ")
-                    +f"priority {item['priority']}/5.")
-            ranked.append({**item,"score":round(score,3),"retrieval_reason":reason})
-    return sorted(ranked,key=lambda x:(x["score"],x["updated_at"]),reverse=True)[:limit]
+            lexical_score = overlap / max(1, math.sqrt(len(terms)))
+            fts_score = (1 - fts_index / max(1, len(fts_order))) if fts_index is not None else 0
+            score = lexical_score + 0.35 * fts_score + item["priority"] * 0.025
+            if fts_index is not None:
+                rank_detail = f"{fts_label} result rank {fts_index + 1}; "
+            else:
+                rank_detail = "lexical match; "
+            reason = f"Shares {overlap} query keyword(s); {rank_detail}priority {item['priority']}/5."
+            ranked.append({**item, "score": round(score, 3), "retrieval_reason": reason})
+
+    return sorted(ranked, key=lambda x: (x["score"], x["updated_at"]), reverse=True)[:limit]
 
 def soft_delete(user_id: int, memory_id: int, db_path: str | None = None) -> bool:
     with connect(db_path) as db:
@@ -271,10 +351,10 @@ def versions(user_id: int, memory_id: int, db_path: str | None = None) -> list[d
     with connect(db_path) as db:
         return [dict(x) for x in db.execute("SELECT v.* FROM memory_versions v JOIN memories m ON m.id=v.memory_id WHERE m.id=? AND m.user_id=? ORDER BY version DESC",(memory_id,user_id)).fetchall()]
 
-def add_temporary(user_id: int, content: str, ttl_hours: int = 24) -> None:
-    with connect() as db:
-        db.execute("DELETE FROM temporary_context WHERE expires_at < ?",(datetime.now(timezone.utc).isoformat(),))
-        db.execute("INSERT INTO temporary_context(user_id,content,expires_at) VALUES(?,?,?)",(user_id,content[:2000],(datetime.now(timezone.utc)+timedelta(hours=ttl_hours)).isoformat()))
+def add_temporary(user_id: int, content: str, ttl_hours: int = 24, db_path: str | None = None) -> None:
+    with connect(db_path) as db:
+        db.execute("DELETE FROM temporary_context WHERE expires_at < ?", (datetime.now(timezone.utc).isoformat(),))
+        db.execute("INSERT INTO temporary_context(user_id,content,expires_at) VALUES(?,?,?)", (user_id, content[:2000], (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()))
 
 def timeline(user_id: int, limit: int = 100, db_path: str | None = None) -> list[dict]:
     """Return genuine version and recorded lifecycle events for one account."""

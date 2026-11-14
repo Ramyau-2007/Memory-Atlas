@@ -71,17 +71,23 @@ function handleAuthError(error) {
 
 async function auth(kind) {
   const message = byId('authMessage');
+  const submit = byId('authSubmit');
   message.textContent = '';
   const username = byId('username').value.trim();
   const password = byId('password').value;
+  if (submit.disabled) return;
+  if (kind === 'register' && invitationRequired && !byId('invitationCode').value.trim()) {
+    message.textContent = 'Enter the demo invitation code provided by the organizer.';
+    byId('invitationCode').focus();
+    return;
+  }
+  submit.disabled = true;
+  byId('authSwitch').disabled = true;
+  submit.textContent = kind === 'register' ? 'Creating account…' : 'Signing in…';
+  message.textContent = kind === 'register' ? 'Creating your account…' : 'Signing in…';
   try {
     if (kind === 'register') {
       const invitationCode = byId('invitationCode').value.trim();
-      if (invitationRequired && !invitationCode) {
-        message.textContent = 'Enter the demo invitation code provided by the organizer.';
-        byId('invitationCode').focus();
-        return;
-      }
       await api('/register', { method: 'POST', body: JSON.stringify({ username, password, invitation_code: invitationCode || null }) });
       byId('password').value = '';
       byId('invitationCode').value = '';
@@ -96,6 +102,11 @@ async function auth(kind) {
     else localStorage.removeItem('sessionToken');
     await showWorkspace();
   } catch (error) { message.textContent = error.message; }
+  finally {
+    submit.disabled = false;
+    byId('authSwitch').disabled = false;
+    submit.textContent = authMode === 'register' ? 'Create New Account' : 'Sign In';
+  }
 }
 
 function setAuthMode(mode) {
@@ -280,7 +291,10 @@ byId('menuToggle').addEventListener('click', () => {
   byId('menuToggle').setAttribute('aria-expanded', String(open));
 });
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') byId('sidebar').classList.remove('open');
+  if (event.key === 'Escape') {
+    byId('sidebar').classList.remove('open');
+    byId('menuToggle').setAttribute('aria-expanded', 'false');
+  }
   if (/^[1-5]$/.test(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName) && !byId('workspace').hidden) {
     const view = ['chat', 'universe', 'memories', 'timeline', 'analytics'][Number(event.key) - 1];
     navigate(view);
@@ -821,21 +835,34 @@ async function loadAnalytics() {
 }
 
 async function bootstrap() {
+  let sessionModeLoaded = false;
+  byId('authMessage').textContent = 'Connecting to Memory Atlas…';
   try {
     const mode = await api('/session-mode');
+    sessionModeLoaded = true;
+    byId('authMessage').textContent = '';
     invitationRequired = Boolean(mode.invitation_required);
     byId('invitationField').hidden = !invitationRequired;
     byId('invitationCode').required = invitationRequired;
     if (mode.cookie_auth) {
       localStorage.removeItem('sessionToken');
       token = null;
-      await api('/session');
+      try { await api('/session'); }
+      catch (error) {
+        if (/sign in|session|unauthori[sz]ed/i.test(error.message)) return;
+        throw error;
+      }
       await showWorkspace();
       return;
     }
     if (token) await showWorkspace();
   } catch (error) {
     if (token) handleAuthError(error);
+    else if (!sessionModeLoaded) {
+      byId('authMessage').textContent = `Could not connect to Memory Atlas. Refresh to retry. (${error.message})`;
+    } else if (!/sign in|session|unauthori[sz]ed/i.test(error.message)) {
+      byId('authMessage').textContent = `Could not restore your session. Refresh to retry. (${error.message})`;
+    }
   }
 }
 bootstrap();

@@ -287,6 +287,27 @@ class ApiWorkflowTests(unittest.TestCase):
         self.assertLessEqual(len(row['title']), 48)
         self.assertTrue(row['title'].startswith('Please help me create'))
 
+    def test_chat_provider_failure_does_not_persist_partial_turn(self):
+        adapter = SimpleNamespace(provider='deterministic', model_name='test', answer=None)
+        existing = self.client.post('/api/conversations', headers=self.alice, json={'title': 'Keep history'})
+        conversation_id = existing.json()['id']
+        before = self.client.get(f'/api/conversations/{conversation_id}/messages', headers=self.alice).json()
+        conversations_before = self.client.get('/api/conversations', headers=self.alice).json()
+
+        with patch('app.main.ModelAdapter', return_value=adapter), \
+             patch('app.main.generate_chat_result', side_effect=ModelUnavailableError('Model unavailable.')):
+            failed_new = self.client.post('/api/chat', headers=self.alice, json={'message': 'Try a new chat'})
+            failed_existing = self.client.post('/api/chat', headers=self.alice, json={
+                'message': 'Try an existing chat', 'conversation_id': conversation_id
+            })
+
+        self.assertEqual(failed_new.status_code, 503)
+        self.assertEqual(failed_existing.status_code, 503)
+        self.assertEqual(self.client.get('/api/conversations', headers=self.alice).json(), conversations_before)
+        self.assertEqual(
+            self.client.get(f'/api/conversations/{conversation_id}/messages', headers=self.alice).json(), before
+        )
+
     def test_auth_validation_and_ownership_failures(self):
         self.assertEqual(self.client.get('/').status_code, 200)
         page = self.client.get('/').text

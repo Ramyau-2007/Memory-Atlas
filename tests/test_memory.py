@@ -2,10 +2,12 @@ import unittest
 import sqlite3
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+from pg8000.exceptions import DatabaseError
 from app.db import init_db, connect
 from app.auth import register, login
 from app.memory import (
-    add_memory, classify, decision_from_analysis, list_memories, needs_memory_analysis,
+    add_memory, add_temporary, classify, decision_from_analysis, list_memories, needs_memory_analysis,
     retrieve, update_memory, soft_delete, recover_deleted, permanently_delete,
     restore_version, validate_memory_analysis, versions,
     deactivate_unedited_source_memories,
@@ -201,5 +203,101 @@ class MemoryTests(unittest.TestCase):
                 event_table = migrated.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_events'").fetchone()
                 self.assertEqual(tuple(user), ('existing-user', 'existing-hash'))
                 self.assertIsNotNone(event_table)
+
+    def test_add_temporary_with_db_path(self):
+        add_temporary(1, "temporary note", ttl_hours=2, db_path=self.db)
+        with connect(self.db) as db:
+            row = db.execute("SELECT content FROM temporary_context WHERE user_id=1").fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["content"], "temporary note")
+
+    def test_postgresql_retrieval_success_and_rank_label(self):
+        mock_db = MagicMock()
+        mock_db.is_postgres = True
+        mock_db.execute.return_value.fetchall.return_value = [
+            {
+                "id": 101,
+                "user_id": 1,
+                "content": "The user loves Python and FastAPI",
+                "category": "preference",
+                "priority": 3,
+                "temporary": 0,
+                "deleted_at": None,
+                "updated_at": "2026-11-14 09:00:00",
+                "fts_rank": 0.85,
+            }
+        ]
+
+        with patch("app.memory.connect", return_value=mock_db):
+            mock_db.__enter__.return_value = mock_db
+            matches = retrieve(1, "Python FastAPI", db_path="fake_pg_url")
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["id"], 101)
+            reason = matches[0]["retrieval_reason"]
+            self.assertIn("PostgreSQL FTS result rank 1;", reason)
+            self.assertNotIn("FTS5", reason)
+            self.assertEqual(reason.count("PostgreSQL FTS"), 1)
+            self.assertEqual(reason.count("result rank 1;"), 1)
+
+            called_sql = mock_db.execute.call_args[0][0]
+            self.assertIn("to_tsvector", called_sql)
+            self.assertIn("to_tsquery", called_sql)
+            self.assertIn("ts_rank_cd", called_sql)
+            self.assertNotIn("memory_search_fts", called_sql)
+            self.assertNotIn("bm25", called_sql)
+
+    def test_postgresql_retrieval_expected_error_fallback(self):
+        mock_db = MagicMock()
+        mock_db.is_postgres = True
+        # Test expected error with PostgreSQL SQLSTATE code 42601 (syntax_error in tsquery)
+        from pg8000.exceptions import DatabaseError
+        pg_err = DatabaseError({'S': 'ERROR', 'V': 'ERROR', 'C': '42601', 'M': 'syntax error in tsquery'})
+        mock_db.execute.side_effect = pg_err
+
+        mock_fallback_memories = [
+            {
+                "id": 102,
+                "user_id": 1,
+                "content": "Fallback Python preference",
+                "category": "preference",
+                "priority": 3,
+                "temporary": 0,
+                "deleted_at": None,
+                "updated_at": "2026-11-14 09:00:00",
+            }
+        ]
+
+        with patch("app.memory.connect", return_value=mock_db), \
+             patch("app.memory.list_memories", return_value=mock_fallback_memories):
+            mock_db.__enter__.return_value = mock_db
+            matches = retrieve(1, "Python query", db_path="fake_pg_url")
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0]["id"], 102)
+            self.assertIn("lexical match;", matches[0]["retrieval_reason"])
+            self.assertNotIn("result rank", matches[0]["retrieval_reason"])
+
+    def test_postgresql_retrieval_unexpected_error_re_raised(self):
+        mock_db = MagicMock()
+        mock_db.is_postgres = True
+        # Verify that an unexpected PostgreSQL connection failure (SQLSTATE 08006)
+        # is re-raised as the original DatabaseError.
+        pg_err = DatabaseError({'S': 'FATAL', 'C': '08006', 'M': 'connection failure'})
+        mock_db.execute.side_effect = pg_err
+
+        with patch("app.memory.connect", return_value=mock_db):
+            mock_db.__enter__.return_value = mock_db
+            with self.assertRaises(DatabaseError) as ctx:
+                retrieve(1, "Python query", db_path="fake_pg_url")
+            self.assertIs(ctx.exception, pg_err)
+
+    def test_sqlite_retrieval_fallback_when_fts_missing(self):
+        mid = add_memory(1, "Direct SQLite preference", "preference", 3, "test", db_path=self.db)
+        with connect(self.db) as db:
+            db.execute("DROP TABLE memory_search_fts")
+        matches = retrieve(1, "preference", db_path=self.db)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["id"], mid)
+        self.assertIn("lexical match;", matches[0]["retrieval_reason"])
+        self.assertNotIn("FTS5 result rank", matches[0]["retrieval_reason"])
 
 if __name__=='__main__': unittest.main()

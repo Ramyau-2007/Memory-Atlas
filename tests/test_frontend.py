@@ -69,6 +69,15 @@ class FrontendRenderingTests(unittest.TestCase):
         self.assertIn('@media (max-width: 560px)',styles)
         self.assertIn('min-height: calc(100dvh - 56px)',styles)
 
+    def test_slow_auth_startup_has_feedback_and_mobile_controls_are_touch_friendly(self):
+        script=(ROOT/'static'/'app.js').read_text(encoding='utf-8')
+        styles=(ROOT/'static'/'style.css').read_text(encoding='utf-8')
+        self.assertIn('Connecting to Memory Atlas…',script)
+        self.assertIn('Could not connect to Memory Atlas. Refresh to retry.',script)
+        self.assertIn('Signing in…',script)
+        self.assertIn('.button, .send-button, .new-chat-button, .nav-item, .icon-button, input, select { min-height: 44px; }',styles)
+        self.assertIn('.composer-foot .muted { display: none; }',styles)
+
 
 if __name__ == '__main__':
     unittest.main()

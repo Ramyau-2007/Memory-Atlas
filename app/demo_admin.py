@@ -45,10 +45,23 @@ def main(argv: list[str] | None = None) -> int:
                 print("No disabled account with that username exists.", file=sys.stderr)
                 return 1
             print("Account enabled. The user must sign in again.")
-    except (ValueError, sqlite3.OperationalError) as exc:
-        print(f"Could not complete the command: {exc}", file=sys.stderr)
-        print("Confirm DATABASE_PATH points to the initialized demo database.", file=sys.stderr)
-        return 2
+    except Exception as exc:
+        # Treat database‑related errors (SQLite, PostgreSQL via SQLAlchemy) as CLI failures.
+        if isinstance(exc, (sqlite3.Error, ValueError)) or getattr(exc, "orig", None):
+            print(f"Could not complete the command: {exc}", file=sys.stderr)
+            print("Confirm DATABASE_PATH points to the initialized demo database.", file=sys.stderr)
+            return 2
+        # Unexpected programming errors should surface for debugging.
+        raise
+        # Database-related errors (SQLite or PostgreSQL) should be reported to the user.
+        # SQLite raises sqlite3.OperationalError; PostgreSQL via SQLAlchemy raises various exceptions
+        # with an 'orig' attribute. We treat them similarly.
+        if isinstance(exc, (sqlite3.Error, ValueError)) or getattr(exc, "orig", None):
+            print(f"Could not complete the command: {exc}", file=sys.stderr)
+            print("Confirm DATABASE_PATH points to the initialized demo database.", file=sys.stderr)
+            return 2
+        # Non-database programming errors are re-raised for visibility.
+        raise
     return 0
 
 

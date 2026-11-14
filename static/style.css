@@ -375,7 +375,8 @@ code { border: 1px solid rgb(155 123 255 / 25%); border-radius: 4px; padding: 1p
   .auth-wrap { grid-template-columns: minmax(0, 440px); padding: 35px 24px; }.auth-aside { display: none; }.aside-copy { margin-top: 110px; }
 }
 @media (max-width: 560px) {
-  .topbar { height: 56px; }.provider-pill { max-width: 145px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
+  .topbar { height: 56px; padding: 0 10px; }.breadcrumbs { min-width: 0; gap: 5px; }.breadcrumbs > span:first-child, .crumb-divider { display: none; }
+  .topbar-right { gap: 6px; }.provider-pill { max-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
   .workspace { padding: 24px 13px 16px; }.page-heading { gap: 9px; margin-bottom: 17px; }.page-heading h1 { font-size: 29px; }.page-heading p { max-width: 300px; font-size: 11px; }
   .heading-action { min-height: 35px; padding: 7px 9px; font-size: 10px; }.panel { padding: 15px; }.panel-head h2 { font-size: 16px; }
   .memory-list { grid-template-columns: 1fr; }.memory-toolbar > .select-wrap { flex: 1; }.memory-toolbar select { width: 100%; min-width: 0; }
@@ -384,6 +385,10 @@ code { border: 1px solid rgb(155 123 255 / 25%); border-radius: 4px; padding: 1p
   .analytics-grid { gap: 8px; }.stat-card { min-height: 112px; padding: 12px; }.stat-card strong { font-size: 27px; }
   .chat-message { max-width: 96%; }.conversation-panel { min-height: 500px; padding: 14px; }
   .field-row { grid-template-columns: 1fr; }.auth-card h1 { font-size: 42px; }.auth-wrap { min-height: calc(100dvh - 56px); padding: 28px 16px; }.auth-card { width: 100%; }.auth-choice .button { min-height: 50px; }
+  .button, .send-button, .new-chat-button, .nav-item, .icon-button, input, select { min-height: 44px; }
+  .heading-action { min-height: 44px; }.mobile-menu { width: 44px; height: 44px; }
+  .conversation-menu summary { width: 44px; height: 44px; }
+  .composer-foot .muted { display: none; }
   .workspace-footer { font-size: 9px; }.workspace-footer span:last-child { text-align: right; }
   .chat-history { max-height: 27vh; }
 }

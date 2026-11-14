@@ -279,9 +279,36 @@ On startup, `init_db()` creates an additive `memory_search_fts` FTS5 table and s
 
 Before applying this change to the existing local database, a consistent SQLite online backup was created at `data/memory.before_fts5_20261019_155034.sqlite3`; `.gitignore` excludes it. For another existing database, stop the app and take a SQLite-consistent backup before its first startup with this version. Restore by stopping the app and copying that backup over the database file. The index is derived and rebuildable; FTS5 is token-based hybrid retrieval, not vector semantic search.
 
+### Neon PostgreSQL Production Migration & Dual-Database Support
+
+Memory Atlas supports both **SQLite** (for local development, offline workflows, and automated testing) and **Neon PostgreSQL** (for cloud deployments, multi-user concurrency, and persistent hosted storage):
+
+- **Automatic Selection**: When `DATABASE_URL` is configured in the environment or `.env`, the application connects to Neon PostgreSQL via SQLAlchemy 2.x and the synchronous `pg8000` driver. If `DATABASE_URL` is omitted, it seamlessly falls back to SQLite at `DATABASE_PATH` (default: `data/memory.sqlite3`).
+- **PostgreSQL Full-Text Search**: In PostgreSQL mode, hybrid memory retrieval utilizes PostgreSQL's native `to_tsvector` and `to_tsquery` capabilities backed by a GIN index on `(content || ' ' || category)`.
+- **Windows Application Control Safe**: The database layer uses pure-Python modules (`pg8000` 1.31.6 and pure-Python SQLAlchemy) to avoid DLL blockages under Windows Defender Application Control policies.
+- **Production Safety Guarantee**: Production startup validates database integrity and required tables (`validate_existing_database()`) and refuses to silently initialize an empty production database.
+
+#### Running the Repeatable Migration Tool
+
+To migrate existing accounts, conversations, messages, memories, and versions from SQLite to Neon PostgreSQL:
+
+1. **Dry-Run Inspection (Non-destructive)**:
+   ```sh
+   python -m scripts.migrate_sqlite_to_postgres --sqlite-path data/memory.sqlite3 --pg-url "postgresql://user:pass@ep-xyz.neon.tech/neondb"
+   ```
+   Inspect the extracted row counts and target status without making any changes. The original SQLite database is opened strictly read-only (`?mode=ro`).
+
+2. **Apply Migration**:
+   ```sh
+   python -m scripts.migrate_sqlite_to_postgres --sqlite-path data/memory.sqlite3 --pg-url "postgresql://user:pass@ep-xyz.neon.tech/neondb" --apply
+   ```
+   This idempotently applies all records using `ON CONFLICT` clauses, preserves foreign-key relationships, and synchronizes PostgreSQL auto-increment sequences (`setval`) to ensure new records never conflict with migrated IDs. Re-running the command is safe and repeatable.
+
 ## Hosted testing deployment preparation
 
-The repository includes a Render Blueprint in `render.yaml`, but this project has **not** been deployed. It configures a single paid web instance and a separate SQLite file at `/var/data/memory-atlas-demo.sqlite3`. The local default remains `data/memory.sqlite3`; the existing `DATABASE_PATH` environment setting selects the database file. Never copy your local SQLite file or `.env` into the hosted service. A new demo disk starts with a separate empty database.
+The repository includes a Render Blueprint in `render.yaml`. It is a **paid** template: `plan: starter` plus a persistent disk mounted at `/var/data`. Do not apply it to a Free service or approve it unless paid hosting is explicitly intended. The project owner reports the current live service is Free and has `DATABASE_PATH=memory.sqlite3`, `MODEL_PROVIDER=deterministic`, and public registration enabled; those dashboard values have not been independently verified from this repository. Render Free local files are not durable across restarts/redeploys, so SQLite at a relative path must not be treated as persistent hosted storage. This application currently supports SQLite only; moving to a free managed PostgreSQL database requires an application and data migration first.
+
+Local development loads `.env` through `python-dotenv`; existing process environment values take precedence. Render dashboard variables are process environment values and can therefore override the provider/path shown in a repository template. The checked-in `.env.example` intentionally defaults to deterministic development responses. A deterministic response is explicitly labeled as non-LLM output. A configured Groq provider is used only when `MODEL_PROVIDER=groq` and a valid server-side `GROQ_API_KEY` are present. Health output reports provider configuration, not a successful model call. Do not claim hosted LLM responses until a non-sensitive request succeeds and the chat response reports the real provider/model.
 
 ### Local production-mode smoke check
 
@@ -290,14 +317,14 @@ The normal development command and bearer-token behavior remain unchanged. To ch
 ### Render setup when you are ready
 
 1. Keep the GitHub repository private and connect it to Render with access only to this repository. Do not upload `.env`, database files, backups, or personal data.
-2. In Render, create a Blueprint deployment from `render.yaml`. Review the displayed plan and charges before confirming. The file has `autoDeploy: false`; it selects a paid 512 MB web plan and a 1 GB persistent disk. Render currently lists the small paid web service at about **$7/month** and disk storage at **$0.25/GB/month**. Verify current prices first. Free web services cannot attach a disk and their local files are ephemeral. A disk-backed Render service is single-instance and cannot scale horizontally.
+2. Do not create or apply the Blueprint for the reported Free service: it specifies paid compute and a paid persistent disk. The Blueprint has `autoDeploy: false`, but manual Blueprint application can still provision the resources it declares. Free hosting with durable account/history storage is not currently supported by this SQLite-only code. First implement and test a free managed PostgreSQL backend, then migrate a verified backup of the actual hosted database. Never replace hosted data with the local SQLite file.
 3. Add `GROQ_API_KEY` through the Render secret/environment-variable form when prompted. Do not put it in repository files, build commands, or this README. The model remains the adapter's existing `openai/gpt-oss-20b` default; no model change is required.
 4. Review `DATABASE_PATH`, cookie, HTTPS, rate-limit, and quota variables in the Blueprint before deploying. Test with synthetic information and separate tester accounts. The on-screen notice describes the current message, selected recent messages, extractive summary in longer chats, retrieved memories, and occasional separate memory-analysis request that may be sent to Groq.
 5. Check `/api/health`, registration, login/logout, account isolation, chat, restart persistence, and deletion/recovery before sharing the URL. Set a Groq account usage limit/alert where available and monitor usage; app request caps do not replace provider-side spending controls.
 
 ### Invitation-only demo access and tester revocation
 
-`DEMO_INVITATIONS_REQUIRED` controls new account creation. It defaults to `false` in development for existing local workflows, but defaults to `true` when `APP_ENV=production`; the Render Blueprint also sets it explicitly to `true`. Confirm this variable in the hosting dashboard before starting the service. Setting it to `false` in production reopens public registration. This setting affects registration only: existing sign-in still uses the normal per-user authentication and ownership checks.
+`DEMO_INVITATIONS_REQUIRED` controls new account creation. It defaults to `false` in development and `true` in production, but explicit environment settings override those defaults. The checked-in Render Blueprint currently sets it to `false`, which permits public registration. Confirm the intended policy in the hosting dashboard; this setting affects registration only, while existing sign-in still uses per-user authentication and ownership checks.
 
 Invitations are generated in a trusted operator terminal connected to the **intended demo database**. In Render, first verify that the service shell is available on your plan, then open the service shell and run:
 
