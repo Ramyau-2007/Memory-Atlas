@@ -31,7 +31,14 @@ async function api(path, options = {}) {
     }
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`);
+  // Handle HTTP errors, with special case for rate limiting (429)
+  if (!response.ok) {
+    if (response.status === 429) {
+      // Provide a user‑friendly message for too many requests
+      throw new Error('Too many requests. Please wait a moment before trying again.');
+    }
+    throw new Error(data.detail || `Request failed (${response.status})`);
+  }
   return data;
 }
 
@@ -620,17 +627,32 @@ document.querySelectorAll('.close-dialog').forEach((button) => button.addEventLi
 byId('memoryForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   const content = byId('memoryContent').value.trim();
+  // 1️⃣ Empty content check (already required)
   if (!content) { byId('memoryFormMessage').textContent = 'Please enter memory content.'; return; }
+  // 2️⃣ Max length (2000 characters) – mirrors backend limit
+  if (content.length > 2000) { byId('memoryFormMessage').textContent = 'Memory content must be at most 2000 characters.'; return; }
+  // 3️⃣ Category validation – must be one of the supported values
+  const category = byId('memoryCategoryInput').value;
+  const allowedCategories = ['fact', 'preference', 'goal', 'project'];
+  if (!allowedCategories.includes(category)) { byId('memoryFormMessage').textContent = `Invalid category. Choose one of: ${allowedCategories.join(', ')}.`; return; }
+  // 4️⃣ Priority validation – integer between 1 and 5
+  const priority = Number(byId('memoryPriority').value);
+  if (!Number.isInteger(priority) || priority < 1 || priority > 5) { byId('memoryFormMessage').textContent = 'Priority must be an integer from 1 (low) to 5 (high).'; return; }
+
   const id = byId('editMemoryId').value;
-  const body = JSON.stringify({ content, category: byId('memoryCategoryInput').value, priority: Number(byId('memoryPriority').value) });
+  const body = JSON.stringify({ content, category, priority });
   byId('saveMemory').disabled = true;
   try {
     if (id) await api(`/memories/${id}`, { method: 'PATCH', body });
     else await api('/memories', { method: 'POST', body });
-    byId('memoryDialog').close(); toast(id ? 'Memory updated. A new version was recorded.' : 'Memory saved.');
+    byId('memoryDialog').close();
+    toast(id ? 'Memory updated. A new version was recorded.' : 'Memory saved.');
     await Promise.all([loadMemories(), loadUniverse(), loadTimeline(), loadAnalytics()]);
-  } catch (error) { byId('memoryFormMessage').textContent = error.message; }
-  finally { byId('saveMemory').disabled = false; }
+  } catch (error) {
+    byId('memoryFormMessage').textContent = error.message;
+  } finally {
+    byId('saveMemory').disabled = false;
+  }
 });
 
 function openAction({ title, description, destructive = false, requirePhrase = false, confirmLabel = 'Confirm', run }) {
