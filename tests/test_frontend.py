@@ -39,13 +39,18 @@ class FrontendRenderingTests(unittest.TestCase):
         self.assertIn('Some messages may also be sent alone for memory analysis',html)
         self.assertIn('up to three matching active memories may be sent to Groq',html)
 
-    def test_deployment_defaults_use_a_separate_persistent_sqlite_path(self):
+    def test_deployment_requires_postgres_and_disables_forwarded_headers(self):
         config=(ROOT/'render.yaml').read_text(encoding='utf-8')
         env=(ROOT/'.env.example').read_text(encoding='utf-8')
         ignore=(ROOT/'.gitignore').read_text(encoding='utf-8')
         self.assertIn('DATABASE_PATH=data/memory.sqlite3',env)
-        self.assertIn('DATABASE_PATH',config)
-        self.assertIn('/var/data/memory-atlas-demo.sqlite3',config)
+        self.assertNotIn('DATABASE_PATH',config)
+        self.assertIn('key: DATABASE_URL',config)
+        self.assertIn('plan: free',config)
+        self.assertIn('sync: false',config)
+        self.assertIn('--no-proxy-headers',config)
+        self.assertNotIn('--proxy-headers',config)
+        self.assertNotIn('forwarded-allow-ips',config)
         self.assertIn('GROQ_API_KEY',config)
         self.assertIn('sync: false',config)
         self.assertIn('.env',ignore)

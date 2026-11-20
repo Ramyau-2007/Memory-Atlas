@@ -1,4 +1,4 @@
-"""Repeatable, idempotent migration tool from SQLite to Neon PostgreSQL.
+"""Fail-fast SQLite-to-PostgreSQL migration for an empty destination.
 
 Preserves all existing data, accounts, chat history, memories, versions,
 invitations, and sessions without modifying the original SQLite database.
@@ -17,12 +17,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.db import (
-    connect,
     get_pg_engine,
     init_postgres_db,
     is_postgres_target,
     normalize_pg_url,
-    PostgresConnectionWrapper,
 )
 from sqlalchemy import text
 
@@ -34,35 +32,30 @@ TABLE_DEFINITIONS = [
         "table": "users",
         "columns": ["id", "username", "password_hash", "created_at", "disabled_at"],
         "pk": "id",
-        "update_columns": ["username", "password_hash", "disabled_at"],
         "has_sequence": True,
     },
     {
         "table": "invitations",
         "columns": ["id", "token_hash", "created_at", "expires_at", "redeemed_at", "revoked_at"],
         "pk": "id",
-        "update_columns": [],  # DO NOTHING
         "has_sequence": False,
     },
     {
         "table": "sessions",
         "columns": ["token_hash", "user_id", "expires_at"],
         "pk": "token_hash",
-        "update_columns": [],  # DO NOTHING
         "has_sequence": False,
     },
     {
         "table": "conversations",
         "columns": ["id", "user_id", "title", "summary", "created_at"],
         "pk": "id",
-        "update_columns": ["title", "summary"],
         "has_sequence": True,
     },
     {
         "table": "messages",
         "columns": ["id", "conversation_id", "role", "content", "created_at"],
         "pk": "id",
-        "update_columns": ["content"],
         "has_sequence": True,
     },
     {
@@ -73,31 +66,24 @@ TABLE_DEFINITIONS = [
             "source_message_id",
         ],
         "pk": "id",
-        "update_columns": [
-            "content", "category", "priority", "source", "reason", "temporary",
-            "deleted_at", "updated_at", "source_message_id",
-        ],
         "has_sequence": True,
     },
     {
         "table": "memory_versions",
         "columns": ["id", "memory_id", "version", "content", "category", "priority", "reason", "created_at"],
         "pk": "id",
-        "update_columns": ["content", "category", "priority", "reason"],
         "has_sequence": True,
     },
     {
         "table": "temporary_context",
         "columns": ["id", "user_id", "content", "expires_at"],
         "pk": "id",
-        "update_columns": ["content", "expires_at"],
         "has_sequence": True,
     },
     {
         "table": "memory_events",
         "columns": ["id", "user_id", "memory_id", "event_type", "created_at"],
         "pk": "id",
-        "update_columns": [],  # DO NOTHING
         "has_sequence": True,
     },
 ]
@@ -134,70 +120,97 @@ def extract_sqlite_table_data(conn: sqlite3.Connection, table_name: str, expecte
     return rows
 
 
-def build_upsert_query(def_dict: dict) -> str:
+def build_insert_query(def_dict: dict) -> str:
     table = def_dict["table"]
     cols = def_dict["columns"]
-    pk = def_dict["pk"]
-    update_cols = def_dict["update_columns"]
-
     cols_str = ", ".join(f'"{c}"' for c in cols)
     params_str = ", ".join(f":{c}" for c in cols)
-
-    if update_cols:
-        updates = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
-        conflict_clause = f"ON CONFLICT (\"{pk}\") DO UPDATE SET {updates}"
-    else:
-        conflict_clause = f"ON CONFLICT (\"{pk}\") DO NOTHING"
-
-    return f"INSERT INTO {table} ({cols_str}) VALUES ({params_str}) {conflict_clause}"
+    return f"INSERT INTO {table} ({cols_str}) VALUES ({params_str})"
 
 
-def get_pg_table_counts(engine) -> dict[str, int]:
+def _pg_table_counts(conn) -> dict[str, int]:
+    """Count application rows; missing tables mean zero, query errors propagate."""
+    result = conn.execute(text("""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = current_schema()
+    """))
+    existing_tables = {row[0] for row in result.fetchall()}
     counts = {}
-    with engine.connect() as conn:
-        for tdef in TABLE_DEFINITIONS:
-            table = tdef["table"]
-            try:
-                c = conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
-                counts[table] = int(c or 0)
-            except Exception:
-                counts[table] = 0
+    for tdef in TABLE_DEFINITIONS:
+        table = tdef["table"]
+        if table not in existing_tables:
+            counts[table] = 0
+            continue
+        count = conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
+        if count is None:
+            raise RuntimeError(f"Could not read the row count for PostgreSQL table '{table}'.")
+        counts[table] = int(count)
     return counts
 
 
-def reset_sequences(engine) -> None:
+def get_pg_table_counts(engine) -> dict[str, int]:
+    """Read target counts without modifying PostgreSQL; failures are fatal."""
     with engine.connect() as conn:
-        with conn.begin():
-            for tdef in TABLE_DEFINITIONS:
-                if tdef["has_sequence"]:
-                    table = tdef["table"]
-                    pk = tdef["pk"]
-                    seq_query = text(f"""
-                        SELECT setval(
-                            pg_get_serial_sequence('{table}', '{pk}'),
-                            COALESCE((SELECT MAX({pk}) FROM {table}), 1),
-                            COALESCE((SELECT COUNT(*) > 0 FROM {table}), false)
-                        )
-                    """)
-                    try:
-                        conn.execute(seq_query)
-                    except Exception as e:
-                        logger.warning("Could not reset sequence for %s: %s", table, e)
+        return _pg_table_counts(conn)
+
+
+def reset_sequences(conn) -> None:
+    """Restart serial sequences transactionally after preserving source IDs."""
+    for tdef in TABLE_DEFINITIONS:
+        if not tdef["has_sequence"]:
+            continue
+        table, pk = tdef["table"], tdef["pk"]
+        sequence = conn.execute(text(
+            "SELECT pg_get_serial_sequence(:table_name, :column_name)"
+        ), {"table_name": table, "column_name": pk}).scalar()
+        if not sequence:
+            raise RuntimeError(f"PostgreSQL serial sequence is missing for {table}.{pk}.")
+        next_value = conn.execute(text(
+            f"SELECT COALESCE(MAX({pk}), 0) + 1 FROM {table}"
+        )).scalar()
+        if next_value is None:
+            raise RuntimeError(f"Could not determine the next sequence value for {table}.{pk}.")
+        alter_sequence = conn.execute(text("""
+            SELECT format(
+                'ALTER SEQUENCE %s RESTART WITH %s',
+                CAST(:sequence_name AS regclass), :next_value
+            )
+        """), {"sequence_name": sequence, "next_value": int(next_value)}).scalar()
+        if not alter_sequence:
+            raise RuntimeError(f"Could not prepare the sequence update for {table}.{pk}.")
+        conn.exec_driver_sql(alter_sequence)
+
+
+class _MigrationConnectionAdapter:
+    """Pass raw PostgreSQL DDL through the active transaction connection."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, statement: str):
+        return self.connection.exec_driver_sql(statement)
 
 
 def run_migration(sqlite_path: str, pg_url: str, apply: bool = False) -> dict:
     sqlite_conn = open_sqlite_readonly(sqlite_path)
-    engine = get_pg_engine(pg_url)
+    try:
+        source_tables = {row[0] for row in sqlite_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        required_source_tables = {"users", "sessions", "conversations", "messages", "memories"}
+        if not required_source_tables.issubset(source_tables):
+            missing = sorted(required_source_tables - source_tables)
+            raise RuntimeError(f"SQLite source is missing required application tables: {missing}")
+        sqlite_data = {}
+        sqlite_counts = {}
+        for tdef in TABLE_DEFINITIONS:
+            table = tdef["table"]
+            rows = extract_sqlite_table_data(sqlite_conn, table, tdef["columns"])
+            sqlite_data[table] = rows
+            sqlite_counts[table] = len(rows)
+    finally:
+        sqlite_conn.close()
 
-    # 1. Read SQLite record counts
-    sqlite_data = {}
-    sqlite_counts = {}
-    for tdef in TABLE_DEFINITIONS:
-        table = tdef["table"]
-        rows = extract_sqlite_table_data(sqlite_conn, table, tdef["columns"])
-        sqlite_data[table] = rows
-        sqlite_counts[table] = len(rows)
-    sqlite_conn.close()
+    engine = get_pg_engine(pg_url)
 
     # 2. Check initial target counts
     initial_pg_counts = get_pg_table_counts(engine)
@@ -214,6 +227,12 @@ def run_migration(sqlite_path: str, pg_url: str, apply: bool = False) -> dict:
         logger.info("%-20s %-15d %-15d", table, sqlite_counts[table], initial_pg_counts.get(table, 0))
     logger.info("---------------------------------------------------")
 
+    if apply and any(initial_pg_counts.values()):
+        raise RuntimeError(
+            "Destination PostgreSQL database contains existing Memory Atlas data; refusing migration. "
+            "Use a new empty database."
+        )
+
     if not apply:
         logger.info("DRY RUN completed. No database changes were made.")
         logger.info("To perform actual migration, pass --apply flag.")
@@ -223,30 +242,38 @@ def run_migration(sqlite_path: str, pg_url: str, apply: bool = False) -> dict:
             "pg_counts": initial_pg_counts,
         }
 
-    # 3. Apply schema if missing
-    logger.info("Initializing / verifying PostgreSQL schema...")
-    wrapper = PostgresConnectionWrapper(engine)
-    init_postgres_db(wrapper)
+    # DDL, application rows, sequence restarts, and verification share one
+    # transaction. Table locks close the gap between the initial read-only
+    # preflight and writes, including races with a concurrently starting app.
+    logger.info("Initializing / verifying PostgreSQL schema transactionally...")
+    with engine.begin() as conn:
+        init_postgres_db(_MigrationConnectionAdapter(conn))
+        table_list = ", ".join(tdef["table"] for tdef in TABLE_DEFINITIONS)
+        conn.exec_driver_sql(f"LOCK TABLE {table_list} IN ACCESS EXCLUSIVE MODE")
+        locked_counts = _pg_table_counts(conn)
+        if any(locked_counts.values()):
+            raise RuntimeError(
+                "Destination PostgreSQL database contains existing Memory Atlas data; refusing migration. "
+                "Use a new empty database."
+            )
 
-    # 4. Migrate each table in dependency order
-    with engine.connect() as conn:
-        with conn.begin():
-            for tdef in TABLE_DEFINITIONS:
-                table = tdef["table"]
-                rows = sqlite_data[table]
-                if not rows:
-                    continue
-                upsert_sql = text(build_upsert_query(tdef))
-                logger.info("Migrating %d row(s) into '%s'...", len(rows), table)
-                # Batch execute upsert
-                conn.execute(upsert_sql, rows)
+        for tdef in TABLE_DEFINITIONS:
+            table = tdef["table"]
+            rows = sqlite_data[table]
+            if not rows:
+                continue
+            insert_sql = text(build_insert_query(tdef))
+            logger.info("Migrating %d row(s) into '%s'...", len(rows), table)
+            conn.execute(insert_sql, rows)
 
-    # 5. Reset auto-increment sequences
-    logger.info("Synchronizing PostgreSQL sequences to prevent ID clashes...")
-    reset_sequences(engine)
-
-    # 6. Verify final counts
-    final_pg_counts = get_pg_table_counts(engine)
+        logger.info("Synchronizing PostgreSQL sequences transactionally...")
+        reset_sequences(conn)
+        final_pg_counts = _pg_table_counts(conn)
+        if final_pg_counts != sqlite_counts:
+            raise RuntimeError(
+                "Migration row-count verification failed; rolling back. "
+                f"SQLite counts: {sqlite_counts}; PostgreSQL counts: {final_pg_counts}"
+            )
     logger.info("================ VERIFICATION ================")
     logger.info("%-20s %-15s %-15s", "Table", "SQLite Rows", "Final PG Rows")
     logger.info("---------------------------------------------------")

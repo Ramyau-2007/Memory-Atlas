@@ -8,7 +8,7 @@ from fastapi import FastAPI, Depends, HTTPException, Response, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from .db import DATABASE_PATH, init_db, connect, validate_existing_database
+from .db import init_db, connect, is_postgres_target, validate_existing_database
 from .auth import register, login, current_user, revoke
 from .invitations import invitations_required
 from . import memory
@@ -27,17 +27,16 @@ async def lifespan(app):
             and env_flag("SESSION_COOKIE_AUTH") and not env_flag("SESSION_COOKIE_SECURE")):
         raise RuntimeError("SESSION_COOKIE_SECURE must be enabled when cookie authentication is used in production.")
     if production:
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if not is_postgres_target(database_url):
+            raise RuntimeError(
+                "Production requires a PostgreSQL DATABASE_URL. "
+                "SQLite is supported for local development only."
+            )
         db_target, db_metric = validate_existing_database()
-        if db_target == "postgresql":
-            logger.info("Production PostgreSQL database validated: user_count=%d", db_metric)
-        else:
-            if not Path(DATABASE_PATH).is_absolute():
-                logger.warning(
-                    "Production DATABASE_PATH is relative (resolved=%s); filesystem durability "
-                    "depends on the hosting provider.", db_target)
-            logger.info("Production SQLite database validated: path=%s size_bytes=%d",
-                        db_target, db_metric)
-    init_db()
+        logger.info("Production PostgreSQL database validated: user_count=%d", db_metric)
+    else:
+        init_db()
     yield
 
 _production = os.getenv("APP_ENV", "development").strip().lower() == "production"

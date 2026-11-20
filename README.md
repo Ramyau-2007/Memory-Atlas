@@ -279,96 +279,98 @@ On startup, `init_db()` creates an additive `memory_search_fts` FTS5 table and s
 
 Before applying this change to the existing local database, a consistent SQLite online backup was created at `data/memory.before_fts5_20261019_155034.sqlite3`; `.gitignore` excludes it. For another existing database, stop the app and take a SQLite-consistent backup before its first startup with this version. Restore by stopping the app and copying that backup over the database file. The index is derived and rebuildable; FTS5 is token-based hybrid retrieval, not vector semantic search.
 
-### Neon PostgreSQL Production Migration & Dual-Database Support
+### Hosting and production deployment
 
-Memory Atlas supports both **SQLite** (for local development, offline workflows, and automated testing) and **Neon PostgreSQL** (for cloud deployments, multi-user concurrency, and persistent hosted storage):
+Memory Atlas serves its HTML, CSS, JavaScript, and API from one FastAPI origin. Browsers need no local software. The repository includes a Render Blueprint (`render.yaml`) for a **Free** Python web service with HTTPS at the host edge, secure HTTP-only cookie sessions, open registration, deterministic responses, and restricted proxy-header handling. It does not define a Render database or persistent disk. `autoDeploy: false` disables automatic deploys after setup; it does not prevent the initial Blueprint setup from creating the web service.
 
-- **Automatic Selection**: When `DATABASE_URL` is configured in the environment or `.env`, the application connects to Neon PostgreSQL via SQLAlchemy 2.x and the synchronous `pg8000` driver. If `DATABASE_URL` is omitted, it seamlessly falls back to SQLite at `DATABASE_PATH` (default: `data/memory.sqlite3`).
-- **PostgreSQL Full-Text Search**: In PostgreSQL mode, hybrid memory retrieval utilizes PostgreSQL's native `to_tsvector` and `to_tsquery` capabilities backed by a GIN index on `(content || ' ' || category)`.
-- **Windows Application Control Safe**: The database layer uses pure-Python modules (`pg8000` 1.31.6 and pure-Python SQLAlchemy) to avoid DLL blockages under Windows Defender Application Control policies.
-- **Production Safety Guarantee**: Production startup validates database integrity and required tables (`validate_existing_database()`) and refuses to silently initialize an empty production database.
+PostgreSQL is required in production and is selected with the secret `DATABASE_URL`. Startup refuses to run in production if this is missing, malformed, unreachable, or lacks the required application schema. SQLite remains supported for local development and tests only. The PostgreSQL database must be persistent and initialized before the web service starts.
 
-#### Running the Repeatable Migration Tool
+PostgreSQL memory retrieval uses native `to_tsvector`/`to_tsquery` search backed by a GIN index. The PostgreSQL adapter uses SQLAlchemy and the pure-Python `pg8000` driver.
 
-To migrate existing accounts, conversations, messages, memories, and versions from SQLite to Neon PostgreSQL:
+#### Free option and its limits
 
-1. **Dry-Run Inspection (Non-destructive)**:
-   ```sh
-   python -m scripts.migrate_sqlite_to_postgres --sqlite-path data/memory.sqlite3 --pg-url "postgresql://user:pass@ep-xyz.neon.tech/neondb"
+A zero-cost demonstration can use the Render Free web service in `render.yaml` with a separately created Neon PostgreSQL database. Create/configure Neon separately, then supply its connection URI as `DATABASE_URL` in the Render service's environment dashboard. The Blueprint marks this variable `sync: false`; never put its value in this repository. No Render-managed PostgreSQL resource is needed or defined. The PostgreSQL schema must be initialized before the web service starts; production startup validates the existing database and will fail if it is unavailable or missing the application schema. Render Free filesystems are ephemeral, and Free services cannot attach persistent disks. The application serves checked-in static assets from the repository and uses PostgreSQL for production records, so its normal production flow does not need persistent local files. ([Render Free limits](https://render.com/docs/free), [Render Blueprint secrets](https://render.com/docs/blueprint-spec))
+
+The PostgreSQL adapter accepts standard `postgres://` and `postgresql://` Neon URIs. It uses pg8000 over certificate-verified TLS for remote hosts and removes libpq's `sslmode` and `channel_binding` options before connecting because pg8000 does not accept them. Neon requires TLS; its copied URL's `channel_binding=require` setting is not implemented by pg8000, while TLS certificate and hostname verification remain enabled. SQLAlchemy keeps a local connection pool with pre-ping and five-minute recycling; its default pool allows five persistent connections plus up to ten overflow connections per process. For web traffic, use Neon's pooled endpoint (`-pooler` hostname). Use a direct endpoint for the migration/setup tool, which performs schema DDL and table locks; Neon recommends direct connections for schema migrations and pooled connections for web applications. ([Neon connection strings](https://neon.com/docs/connect/connect-from-any-app), [Neon connection pooling](https://neon.com/docs/connect/connection-pooling))
+
+Render Free services sleep after 15 minutes without inbound traffic, can take about a minute to wake, and may restart; Render describes Free services as suitable for testing and hobby projects rather than production. Free web services have 512 MB RAM and 0.1 CPU. Given this app's small FastAPI process, single default Uvicorn worker, external PostgreSQL, and deterministic provider (no model loaded in-process), it is likely to fit 512 MB for a low-traffic demonstration, but actual peak memory has not been measured. Neon Free has its own storage, compute, and recovery limits; check current provider terms before setup. ([Render Free limits](https://render.com/docs/free), [Neon plan limits](https://github.com/neondatabase/website/blob/main/content/docs/introduction/plans.md), [Neon recovery history](https://github.com/neondatabase/website/blob/main/content/docs/postgres/backup-restore/history-window.md))
+
+The Free combination keeps database records off Render's ephemeral filesystem, but it has cold starts, usage limits, and weaker recovery guarantees than a paid production database. For public use with user-created memories, choose a database plan with backups and confirm the restore process. Do not treat a free tier as a backup strategy.
+
+#### Production environment variables
+
+Set these in the hosting provider's environment-variable/secret dashboard, never in source control or a build command:
+
+| Variable | Production value / purpose |
+| --- | --- |
+| `APP_ENV` | `production`; enables production database validation and disables interactive API docs. |
+| `DEMO_INVITATIONS_REQUIRED` | `false` for direct public registration; set `true` to require one-time invitations. This only changes registration; existing login still works. |
+| `DATABASE_URL` | Required Neon PostgreSQL connection URI. Set it manually as a Render secret; its value is not stored in `render.yaml` or source control. |
+| `SESSION_COOKIE_AUTH` | `true` to use HTTP-only session cookies in hosted mode. |
+| `SESSION_COOKIE_SECURE` | `true`; required for production cookie authentication over HTTPS. |
+| `ENABLE_HSTS` | `true` when HTTPS is enforced by the host. |
+| `MODEL_PROVIDER` | The Blueprint defaults to `deterministic`, which needs no API key and is explicitly not an LLM. |
+| `GROQ_API_KEY` | Optional secret, only when deliberately choosing `MODEL_PROVIDER=groq`. Never commit or paste it into documentation. Provider charges, limits, and data handling apply. |
+| `PORT` | Supplied by Render; the configured start command binds to it. |
+
+Other available safeguards include `MAX_REQUEST_BODY_BYTES`, registration/login/chat rate limits, and per-user/global Groq daily action limits. The latter counters are process-local and reset on restart; they are not provider billing caps. Review the values in `render.yaml` against expected traffic and configure provider-side spend limits if enabling a paid/usage-billed model.
+
+Open registration does not include email verification, password reset, or account recovery. Users should choose a unique password of at least 10 characters and store it safely. The server enforces registration/login rate limits, and password hashing and per-user data scoping remain enabled.
+
+For a local cookie-authentication smoke check, run the app over HTTPS and set both `SESSION_COOKIE_AUTH=true` and `SESSION_COOKIE_SECURE=true` in the process environment. Cookie mode omits the token from the login response and uses same-origin requests. Do not disable the secure-cookie flag on a public HTTPS deployment.
+
+#### Prepare the PostgreSQL database and preserve existing data
+
+Production startup validates PostgreSQL and refuses to create a production database or schema. Before deploying against a new PostgreSQL database, migrate the authoritative SQLite accounts and content:
+
+1. Create a new, empty PostgreSQL database with your chosen provider. Keep its connection URI private. Migration refuses to proceed if any Memory Atlas application table in the target contains rows. It uses plain inserts; duplicate IDs or other database errors abort the transaction instead of updating destination rows.
+2. Take and verify a consistent backup of the **authoritative** SQLite database. Confirm that `data/memory.sqlite3` is the intended source; if the actual current data lives in a different hosted database, export that database instead. Never replace hosted data with an older local copy.
+3. Set `DATABASE_URL` in the shell running the migration without putting the URI in command history. For PowerShell, for example:
+
+   ```powershell
+   $secret = Read-Host 'PostgreSQL connection URI' -AsSecureString
+   $env:DATABASE_URL = [System.Net.NetworkCredential]::new('', $secret).Password
+   .venv\Scripts\python.exe -m scripts.migrate_sqlite_to_postgres --sqlite-path data/memory.sqlite3
    ```
-   Inspect the extracted row counts and target status without making any changes. The original SQLite database is opened strictly read-only (`?mode=ro`).
 
-2. **Apply Migration**:
-   ```sh
-   python -m scripts.migrate_sqlite_to_postgres --sqlite-path data/memory.sqlite3 --pg-url "postgresql://user:pass@ep-xyz.neon.tech/neondb" --apply
+   The first run is a read-only dry run. It does not initialize the schema or write to either database. Review the source counts and destination counts. Any count-query failure aborts; it is never interpreted as zero.
+4. Only after verifying the empty target and source backup, apply the migration:
+
+   ```powershell
+   .venv\Scripts\python.exe -m scripts.migrate_sqlite_to_postgres --sqlite-path data/memory.sqlite3 --apply
+   Remove-Item Env:DATABASE_URL
    ```
-   This idempotently applies all records using `ON CONFLICT` clauses, preserves foreign-key relationships, and synchronizes PostgreSQL auto-increment sequences (`setval`) to ensure new records never conflict with migrated IDs. Re-running the command is safe and repeatable.
 
-## Hosted testing deployment preparation
+   The script opens the SQLite source read-only and migrates users, sessions, conversations, messages, memories, versions, invitations, temporary context, and events. Schema, rows, sequence restarts, and final count verification run in one PostgreSQL transaction; any failure rolls it all back. It uses plain `INSERT`, never upsert or delete. Review final row counts before configuring the web service. The SQLite source is not modified.
+5. For the free demonstration, use the Free web service plan in `render.yaml`, create/configure Neon separately, and manually set Neon's pooled connection URI as the Render `DATABASE_URL` secret along with the production variables above. Use a direct Neon URI for the migration/setup command in steps 3–4. Do not add a Render-managed database. Render's proxy headers are deliberately not trusted by Uvicorn (see below).
+6. Deploy manually, then verify `/api/health`, HTTPS, registration, login/logout, isolation using two synthetic accounts, restart persistence, and memory recovery/version flows before sharing the URL. A health response only reports the configured provider; it does not verify a Groq API key or model request.
 
-The repository includes a Render Blueprint in `render.yaml`. It is a **paid** template: `plan: starter` plus a persistent disk mounted at `/var/data`. Do not apply it to a Free service or approve it unless paid hosting is explicitly intended. The project owner reports the current live service is Free and has `DATABASE_PATH=memory.sqlite3`, `MODEL_PROVIDER=deterministic`, and public registration enabled; those dashboard values have not been independently verified from this repository. Render Free local files are not durable across restarts/redeploys, so SQLite at a relative path must not be treated as persistent hosted storage. This application currently supports SQLite only; moving to a free managed PostgreSQL database requires an application and data migration first.
+Once registration is open, anyone who can reach the public site can create an account. Keep the repository private if it contains development history, never commit `.env` or database backups, and do not store API keys or database URIs in the repo. No public website URL exists until a real hosting deployment completes and is verified.
 
-Local development loads `.env` through `python-dotenv`; existing process environment values take precedence. Render dashboard variables are process environment values and can therefore override the provider/path shown in a repository template. The checked-in `.env.example` intentionally defaults to deterministic development responses. A deterministic response is explicitly labeled as non-LLM output. A configured Groq provider is used only when `MODEL_PROVIDER=groq` and a valid server-side `GROQ_API_KEY` are present. Health output reports provider configuration, not a successful model call. Do not claim hosted LLM responses until a non-sensitive request succeeds and the chat response reports the real provider/model.
+#### Optional invitation administration
 
-### Local production-mode smoke check
-
-The normal development command and bearer-token behavior remain unchanged. To check the HTTP-only cookie flow locally, use HTTPS or a local HTTPS proxy, then set `SESSION_COOKIE_AUTH=true` and `SESSION_COOKIE_SECURE=true` in the process environment. Cookie mode omits the token from the login JSON, uses same-origin requests, and rejects cross-origin state-changing requests. Do not turn off `SESSION_COOKIE_SECURE` on a public deployment.
-
-### Render setup when you are ready
-
-1. Keep the GitHub repository private and connect it to Render with access only to this repository. Do not upload `.env`, database files, backups, or personal data.
-2. Do not create or apply the Blueprint for the reported Free service: it specifies paid compute and a paid persistent disk. The Blueprint has `autoDeploy: false`, but manual Blueprint application can still provision the resources it declares. Free hosting with durable account/history storage is not currently supported by this SQLite-only code. First implement and test a free managed PostgreSQL backend, then migrate a verified backup of the actual hosted database. Never replace hosted data with the local SQLite file.
-3. Add `GROQ_API_KEY` through the Render secret/environment-variable form when prompted. Do not put it in repository files, build commands, or this README. The model remains the adapter's existing `openai/gpt-oss-20b` default; no model change is required.
-4. Review `DATABASE_PATH`, cookie, HTTPS, rate-limit, and quota variables in the Blueprint before deploying. Test with synthetic information and separate tester accounts. The on-screen notice describes the current message, selected recent messages, extractive summary in longer chats, retrieved memories, and occasional separate memory-analysis request that may be sent to Groq.
-5. Check `/api/health`, registration, login/logout, account isolation, chat, restart persistence, and deletion/recovery before sharing the URL. Set a Groq account usage limit/alert where available and monitor usage; app request caps do not replace provider-side spending controls.
-
-### Invitation-only demo access and tester revocation
-
-`DEMO_INVITATIONS_REQUIRED` controls new account creation. It defaults to `false` in development and `true` in production, but explicit environment settings override those defaults. The checked-in Render Blueprint currently sets it to `false`, which permits public registration. Confirm the intended policy in the hosting dashboard; this setting affects registration only, while existing sign-in still uses per-user authentication and ownership checks.
-
-Invitations are generated in a trusted operator terminal connected to the **intended demo database**. In Render, first verify that the service shell is available on your plan, then open the service shell and run:
+`DEMO_INVITATIONS_REQUIRED=true` enables the existing one-time invitation gate without affecting existing sign-in. The invitation and account lifecycle commands operate on the database selected by `DATABASE_URL` or `DATABASE_PATH`; run them only from a trusted operator environment:
 
 ```sh
 python -m app.demo_admin invite --expires-days 7
-```
-
-The command prints a random one-time code once. Send it privately to one tester; do not paste it into a ticket, URL, chat transcript, or source file. Only a SHA-256 hash is stored in SQLite. The code is redeemed atomically during `POST /api/register`, expires after the selected 1–90 days, and cannot be reused. The existing registration throttle applies to direct API attempts too. The registration page conditionally displays the code field, but the server remains the enforcement point. If a code has not been used, revoke it using its printed ID:
-
-```sh
 python -m app.demo_admin revoke-invite INVITATION_ID
-```
-
-The CLI is not an HTTP endpoint and must only be run by a trusted operator with shell/database access. It does not provide remote access control around the Render service URL. Keep that shell access restricted and verify its availability and permissions for your hosting plan.
-
-To stop a tester from accessing their account without deleting their content, run:
-
-```sh
 python -m app.demo_admin disable-user TESTER_USERNAME
-```
-
-This marks the account disabled and removes its active sessions; bearer tokens and old cookies stop working. Memories, conversations, and versions remain stored and owner-scoped. Re-enable a tester with:
-
-```sh
 python -m app.demo_admin enable-user TESTER_USERNAME
 ```
 
-They must sign in again. Disabling invitation-only registration later requires explicitly setting `DEMO_INVITATIONS_REQUIRED=false` in the host environment and restarting/redeploying; rotation of an unused code does not disable already-created accounts. Account disablement is separate from any later data-retention or deletion decision.
+An invitation is high-entropy, single-use, expires after 1–90 days, and only its hash is stored. Disabling an account revokes sessions but leaves its memories, conversations, and versions in place. These are operator commands, not public HTTP endpoints; protect access to the host shell and database.
 
-#### Database migration safety
+#### Production request and proxy behavior
 
-This release adds an `invitations` table and a nullable `users.disabled_at` column. Startup uses additive `CREATE TABLE IF NOT EXISTS` and a guarded `ALTER TABLE`; it does not reset users or rewrite memories/conversations. Before the first hosted startup with this version, take a database-consistent backup of the hosted SQLite file and verify that you can restore a separate copy. Do not copy the local database into the hosted disk. The local CLI requires the already-initialized database selected by `DATABASE_PATH`; start the app once to initialize a new local database before issuing commands. Never run it against a path until you have checked that `DATABASE_PATH` targets the intended demo database.
-
-The production command configured by the Blueprint is:
+The Blueprint start command deliberately omits Uvicorn proxy-header parsing:
 
 ```sh
-python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
+python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --no-proxy-headers
 ```
 
-The wildcard forwarded-header trust is suitable only when the service is reachable exclusively through the hosting provider's reverse proxy and that proxy sanitizes forwarding headers. Confirm this against the host's network behavior. If that assumption is not valid, configure a narrower trusted proxy list or host-edge rate limiting before inviting testers.
+Uvicorn enables proxy-header parsing by default, so the explicit `--no-proxy-headers` flag matters. Render terminates HTTPS at its edge; the application sets secure cookies and HSTS from the configured environment variables and intentionally ignores `X-Forwarded-For` and `X-Forwarded-Proto`. This prevents clients from spoofing their source IP via forwarded headers without inventing a Render proxy allowlist. The trade-off is that rate limits see the immediate proxy/connection address rather than each real visitor, so unrelated users may share an IP rate-limit bucket. Do not remove `--no-proxy-headers` or add `--forwarded-allow-ips='*'`. The app also limits request bodies, throttles registration/login/chat, adds browser security headers, and checks same-origin writes when cookie auth is enabled. Groq daily caps are per process and reset after restart; they are not hard billing controls.
 
-The app limits request bodies, throttles registration/login/chat by the server-visible client address, adds browser security headers, and uses a same-origin check for cookie-authenticated writes. Groq chat actions also have per-user and service-wide daily process-local caps (25 and 200 by default). Each action can cause up to two Groq completions when memory interpretation runs. These in-memory counters reset on service restart and do not coordinate across instances; this deployment is intentionally single-instance. They are safeguards for a small test, not hard billing limits. Provider-side usage monitoring is still necessary.
-
-SQLite schema initialization is unchanged and additive; this preparation added no schema migration and did not touch the local database. Maintain independent, consistent SQLite backups for hosted tester data. A host disk snapshot is useful for recovery but is not a substitute for a database-aware backup and restore check. The hosted demo should have a clear cleanup schedule and should not promise deletion from provider logs or backups.
+SQLite and PostgreSQL initialization is additive (`CREATE TABLE IF NOT EXISTS` and guarded column additions); it does not drop or reseed existing records. Keep database-aware backups and test restoring them. Provider backups, logs, and retention policies are separate from application deletion; do not promise deletion from provider backups or logs.
 
 ## Testing and evaluation
 
@@ -385,7 +387,7 @@ Compile the Python modules:
 python -m compileall -q app tests evaluation
 ```
 
-Deployment-preparation verification: `python -m pytest -q -p no:cacheprovider` and `python -m unittest discover -s tests -v` each passed **54 tests**. `python -m compileall -q app tests evaluation` completed successfully. Both test runs emitted one Starlette deprecation warning about the installed `httpx` integration; it did not fail the tests. Tests use temporary databases and mocked Groq calls; no live model request is part of the suite.
+Tests use temporary databases and mocked Groq calls; no live model request is part of the suite. On Windows, if the default pytest temporary directory is inaccessible, pass a fresh writable path with `--basetemp` (for example, a new directory under `.venv`).
 
 Run the baseline comparison:
 

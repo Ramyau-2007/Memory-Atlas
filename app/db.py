@@ -8,7 +8,7 @@ import sys
 from importlib.abc import MetaPathFinder
 from importlib.machinery import SourceFileLoader, ModuleSpec
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +45,23 @@ logger = logging.getLogger(__name__)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/memory.sqlite3")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
+POSTGRES_REQUIRED_COLUMNS = {
+    "users": {"id", "username", "password_hash", "created_at", "disabled_at"},
+    "invitations": {"id", "token_hash", "created_at", "expires_at", "redeemed_at", "revoked_at"},
+    "sessions": {"token_hash", "user_id", "expires_at"},
+    "conversations": {"id", "user_id", "title", "summary", "created_at"},
+    "messages": {"id", "conversation_id", "role", "content", "created_at"},
+    "memories": {
+        "id", "user_id", "content", "category", "priority", "source", "reason",
+        "temporary", "deleted_at", "created_at", "updated_at", "source_message_id",
+    },
+    "memory_versions": {
+        "id", "memory_id", "version", "content", "category", "priority", "reason", "created_at",
+    },
+    "temporary_context": {"id", "user_id", "content", "expires_at"},
+    "memory_events": {"id", "user_id", "memory_id", "event_type", "created_at"},
+}
+
 _pg_engines: dict[str, Engine] = {}
 
 
@@ -73,26 +90,40 @@ def get_pg_engine(url: str | None = None) -> Engine:
     normalized = normalize_pg_url(raw_url)
     if normalized not in _pg_engines:
         connect_args = {}
+        engine_url = normalized
         try:
-            # Parse both normalized URL (without sslmode) and original URL (may contain sslmode)
+            # libpq URLs (including Neon URLs) may contain sslmode and
+            # channel_binding options. pg8000 takes TLS configuration through
+            # ssl_context and does not accept these as connection keywords.
             parsed = urlsplit(normalized)
-            original_parsed = urlsplit(raw_url)
-            # Extract sslmode from original URL query parameters
-            query_params = dict(qc.split("=") for qc in original_parsed.query.split("&") if "=" in qc)
+            query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+            query_params = dict(query_pairs)
             sslmode = query_params.get("sslmode")
             hostname = parsed.hostname
-            # Enforce SSL for remote hosts or when sslmode=require is specified
-            if hostname and hostname not in ("localhost", "127.0.0.1"):
-                if sslmode == "require" or sslmode is None:
-                    connect_args["ssl_context"] = ssl.create_default_context()
-            elif sslmode == "require":
-                # Localhost with explicit require
+            # Always verify TLS certificates for remote PostgreSQL hosts. This
+            # satisfies Neon and avoids passing unsupported libpq sslmode values
+            # into pg8000. Honor an explicit require mode for local TLS too.
+            if hostname and hostname.lower() not in ("localhost", "127.0.0.1"):
                 connect_args["ssl_context"] = ssl.create_default_context()
+            elif sslmode and sslmode.lower() in {"require", "verify-ca", "verify-full"}:
+                connect_args["ssl_context"] = ssl.create_default_context()
+
+            unsupported_pg8000_options = {"sslmode", "channel_binding"}
+            if any(key.lower() in unsupported_pg8000_options for key, _ in query_pairs):
+                engine_query = urlencode(
+                    [
+                        (key, value) for key, value in query_pairs
+                        if key.lower() not in unsupported_pg8000_options
+                    ]
+                )
+                engine_url = urlunsplit(
+                    (parsed.scheme, parsed.netloc, parsed.path, engine_query, parsed.fragment)
+                )
         except Exception:
             connect_args["ssl_context"] = ssl.create_default_context()
 
         engine = create_engine(
-            normalized,
+            engine_url,
             connect_args=connect_args,
             pool_pre_ping=True,
             pool_recycle=300,
@@ -345,14 +376,27 @@ def validate_existing_database(path: str | None = None) -> tuple[str, int]:
         try:
             with engine.connect() as conn:
                 res = conn.execute(
-                    text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+                    text("""
+                        SELECT table_name, column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                    """)
                 )
-                tables = {row[0] for row in res.fetchall()}
-                required = {"users", "sessions", "conversations", "messages", "memories"}
-                if not required.issubset(tables):
+                schema = {}
+                for row in res.fetchall():
+                    schema.setdefault(row[0], set()).add(row[1])
+                missing_tables = set(POSTGRES_REQUIRED_COLUMNS) - set(schema)
+                missing_columns = {
+                    table: columns - schema.get(table, set())
+                    for table, columns in POSTGRES_REQUIRED_COLUMNS.items()
+                    if columns - schema.get(table, set())
+                }
+                if missing_tables or missing_columns:
                     raise RuntimeError(
-                        f"Production PostgreSQL database is missing required tables: {required - tables}. "
-                        "Refusing to initialize an empty database; run migration script first or verify DATABASE_URL."
+                        "Production PostgreSQL schema is incomplete "
+                        f"(missing tables: {sorted(missing_tables)}, missing columns: {missing_columns}). "
+                        "Refusing to initialize or modify it; run the explicit migration/setup process "
+                        "or verify DATABASE_URL."
                     )
                 user_count = conn.execute(text("SELECT COUNT(*) FROM users")).scalar() or 0
                 return "postgresql", int(user_count)

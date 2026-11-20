@@ -1,6 +1,8 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, MagicMock
+from unittest.mock import patch
 
 from app.db import (
     normalize_pg_url,
@@ -8,11 +10,57 @@ from app.db import (
     DbRow,
     CursorResultWrapper,
     is_postgres_target,
+    POSTGRES_REQUIRED_COLUMNS,
     PostgresConnectionWrapper,
+    validate_existing_database,
 )
 
 
 class PostgresDbUnitTests(unittest.TestCase):
+    def _validation_engine(self, schema_rows, user_count=1, query_error=None):
+        conn = Mock()
+        if query_error is not None:
+            conn.execute.side_effect = query_error
+        else:
+            schema_result = Mock()
+            schema_result.fetchall.return_value = schema_rows
+            users_result = Mock()
+            users_result.scalar.return_value = user_count
+            conn.execute.side_effect = [schema_result, users_result]
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = conn
+        engine = Mock()
+        engine.connect.return_value = connection_context
+        return engine
+
+    def test_production_postgres_validation_requires_complete_schema(self):
+        rows = [(table, column) for table, columns in POSTGRES_REQUIRED_COLUMNS.items()
+                for column in columns]
+        engine = self._validation_engine(rows, user_count=3)
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://user:pass@host/db"}), \
+             patch("app.db.get_pg_engine", return_value=engine):
+            target, metric = validate_existing_database()
+        self.assertEqual((target, metric), ("postgresql", 3))
+
+    def test_production_postgres_validation_refuses_incomplete_schema(self):
+        rows = [(table, column) for table, columns in POSTGRES_REQUIRED_COLUMNS.items()
+                for column in columns]
+        rows = [(table, column) for table, column in rows
+                if not (table == "memory_versions" and column == "reason")]
+        engine = self._validation_engine(rows)
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://user:pass@host/db"}), \
+             patch("app.db.get_pg_engine", return_value=engine):
+            with self.assertRaisesRegex(RuntimeError, "schema is incomplete"):
+                validate_existing_database()
+        self.assertEqual(engine.connect.return_value.__enter__.return_value.execute.call_count, 1)
+
+    def test_production_postgres_query_errors_fail_closed(self):
+        engine = self._validation_engine([], query_error=RuntimeError("permission denied"))
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://user:pass@host/db"}), \
+             patch("app.db.get_pg_engine", return_value=engine):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                validate_existing_database()
+
     def test_normalize_pg_url(self):
         self.assertEqual(
             normalize_pg_url("postgres://user:pass@host/db"),
@@ -26,6 +74,25 @@ class PostgresDbUnitTests(unittest.TestCase):
             normalize_pg_url("postgresql+pg8000://user:pass@host/db"),
             "postgresql+pg8000://user:pass@host/db",
         )
+
+    def test_neon_sslmode_url_uses_pg8000_ssl_context_without_unsupported_query(self):
+        from unittest.mock import MagicMock
+        from app.db import get_pg_engine
+
+        url = (
+            "postgresql://user:pass@ep-example-pooler.us-east-2.aws.neon.tech/"
+            "neondb?sslmode=require&channel_binding=require&application_name=memory-atlas"
+        )
+        with patch("app.db.create_engine", return_value=MagicMock()) as create_engine:
+            get_pg_engine(url)
+
+        engine_url = create_engine.call_args.args[0]
+        connect_args = create_engine.call_args.kwargs["connect_args"]
+        self.assertIn("application_name=memory-atlas", engine_url)
+        self.assertNotIn("sslmode", engine_url)
+        self.assertNotIn("channel_binding", engine_url)
+        self.assertIn("ssl_context", connect_args)
+        self.assertTrue(hasattr(connect_args["ssl_context"], "load_default_certs"))
 
     def test_is_postgres_target(self):
         self.assertTrue(is_postgres_target("postgres://user:pass@host/db"))

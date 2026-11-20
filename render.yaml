@@ -2,28 +2,20 @@ services:
   - type: web
     name: memory-atlas-demo
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: python -m pip install -r requirements.txt
-    startCommand: >-
-      python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT
-      --proxy-headers --forwarded-allow-ips='*'
+    startCommand: python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --no-proxy-headers
     healthCheckPath: /api/health
     autoDeploy: false
-    disk:
-      name: memory-atlas-demo-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: APP_ENV
         value: production
       - key: DEMO_INVITATIONS_REQUIRED
         value: "false"
-      - key: DATABASE_PATH
-        value: /var/data/memory-atlas-demo.sqlite3
       - key: DATABASE_URL
         sync: false
       - key: MODEL_PROVIDER
-        value: groq
+        value: deterministic
       - key: GROQ_API_KEY
         sync: false
       - key: SESSION_COOKIE_AUTH

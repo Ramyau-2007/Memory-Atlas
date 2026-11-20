@@ -858,6 +858,39 @@ class ApiWorkflowTests(unittest.TestCase):
                 with TestClient(app):
                     pass
 
+    def test_production_requires_postgresql_before_initializing_database(self):
+        with patch.dict(os.environ,{
+            'APP_ENV':'production','SESSION_COOKIE_AUTH':'true','SESSION_COOKIE_SECURE':'true',
+            'DATABASE_URL':'',
+        }), patch('app.main.init_db') as initialize:
+            with self.assertRaisesRegex(RuntimeError,'Production requires a PostgreSQL DATABASE_URL'):
+                with TestClient(app):
+                    pass
+        initialize.assert_not_called()
+
+    def test_production_validates_postgres_before_schema_initialization(self):
+        with patch.dict(os.environ,{
+            'APP_ENV':'production','SESSION_COOKIE_AUTH':'true','SESSION_COOKIE_SECURE':'true',
+            'DATABASE_URL':'postgresql://user:password@db.example.test/atlas',
+        }), patch('app.main.validate_existing_database', side_effect=RuntimeError('schema is missing')) as validate, \
+             patch('app.main.init_db') as initialize:
+            with self.assertRaisesRegex(RuntimeError,'schema is missing'):
+                with TestClient(app):
+                    pass
+        validate.assert_called_once_with()
+        initialize.assert_not_called()
+
+    def test_production_startup_validates_postgres_without_running_schema_initializer(self):
+        with patch.dict(os.environ,{
+            'APP_ENV':'production','SESSION_COOKIE_AUTH':'true','SESSION_COOKIE_SECURE':'true',
+            'DATABASE_URL':'postgresql://user:password@db.example.test/atlas',
+        }), patch('app.main.validate_existing_database', return_value=('postgresql', 2)) as validate, \
+             patch('app.main.init_db') as initialize:
+            with TestClient(app):
+                pass
+        validate.assert_called_once_with()
+        initialize.assert_not_called()
+
     def test_groq_daily_action_quota_is_user_and_service_limited(self):
         provider_response=Mock()
         provider_response.json.return_value={'choices':[{'message':{'content':'Mocked hosted reply.'}}]}
