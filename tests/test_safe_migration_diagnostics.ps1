@@ -28,14 +28,47 @@ $outerFailureFunction = $wrapperAst.Find({
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $node.Name -eq 'Get-SafeOuterFailureMessage'
 }, $true)
-if ($null -eq $parserFunction -or $null -eq $displayFunction -or $null -eq $outerFailureFunction) {
+$uriValidatorFunction = $wrapperAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Get-NeonUriRejectionCategory'
+}, $true)
+if ($null -eq $parserFunction -or $null -eq $displayFunction -or
+    $null -eq $outerFailureFunction -or $null -eq $uriValidatorFunction) {
     throw 'Safe diagnostic functions were not found.'
 }
+$wrapperSource = Get-Content -LiteralPath $wrapperPath -Raw
 Invoke-Expression $parserFunction.Extent.Text
 Invoke-Expression $displayFunction.Extent.Text
 Invoke-Expression $outerFailureFunction.Extent.Text
+Invoke-Expression $uriValidatorFunction.Extent.Text
 
-$wrapperSource = Get-Content -LiteralPath $wrapperPath -Raw
+$uriValidationCases = @(
+    @{ Name = 'postgresql direct URI'; Value = 'postgresql://demo_user:demo%21pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require'; Expected = $null },
+    @{ Name = 'postgres direct URI'; Value = 'postgres://demo_user:demo%21pass@ep-pooler-demo.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = $null },
+    @{ Name = 'pooled endpoint'; Value = 'postgresql://demo_user:demo%21pass@ep-example-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = 'pooled endpoint' },
+    @{ Name = 'unsupported scheme'; Value = 'https://demo_user:demo%21pass@ep-example.us-east-2.aws.neon.tech/neondb'; Expected = 'unsupported scheme' },
+    @{ Name = 'malformed URI'; Value = 'postgresql://[malformed'; Expected = 'invalid URI' },
+    @{ Name = 'missing credential separator'; Value = 'postgresql://ep-example.us-east-2.aws.neon.tech/neondb'; Expected = 'missing credential separator' },
+    @{ Name = 'non-Neon host'; Value = 'postgresql://demo_user:demo%21pass@db.example.test/neondb'; Expected = 'non-Neon host' }
+)
+$allowedUriRejections = @('invalid URI', 'unsupported scheme', 'non-Neon host', 'pooled endpoint', 'missing credential separator')
+foreach ($case in $uriValidationCases) {
+    $actual = Get-NeonUriRejectionCategory -Value $case.Value
+    if ($actual -cne $case.Expected) {
+        throw "Synthetic URI validation case failed: $($case.Name)."
+    }
+    if ($null -ne $actual -and $actual -cnotin $allowedUriRejections) {
+        throw "URI validator returned a non-allowlisted rejection category for $($case.Name)."
+    }
+}
+$validatorCallIndex = $wrapperSource.IndexOf('$uriRejectionCategory = Get-NeonUriRejectionCategory', [System.StringComparison]::Ordinal)
+$pythonInvocationIndex = $wrapperSource.IndexOf('$migrationOutput = @(& $python -m scripts.migrate_sqlite_to_postgres', [System.StringComparison]::Ordinal)
+if ($validatorCallIndex -lt 0 -or $pythonInvocationIndex -le $validatorCallIndex) {
+    throw 'URI validation is not positioned before Python invocation.'
+}
+Write-Output 'Synthetic Direct URI acceptance and fixed URI rejection categories: PASS'
+
 $outerStages = @('setup', 'SQLite preflight', 'hidden URI input', 'URI validation', 'Python invocation', 'count reporting')
 foreach ($stageName in $outerStages) {
     if ($wrapperSource -notmatch [regex]::Escape("`$currentStage = '$stageName'")) {

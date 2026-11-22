@@ -35,6 +35,33 @@ function Get-SafeOuterFailureMessage {
     return "Migration not started. Stage: $Stage."
 }
 
+function Get-NeonUriRejectionCategory {
+    param([AllowNull()][string]$Value)
+
+    try {
+        $parsedUri = [System.Uri]$Value
+        if (-not $parsedUri.IsAbsoluteUri) {
+            return 'invalid URI'
+        }
+        if ($parsedUri.Scheme -notin @('postgres', 'postgresql')) {
+            return 'unsupported scheme'
+        }
+        if ($parsedUri.Host -notmatch '\.neon\.tech$') {
+            return 'non-Neon host'
+        }
+        if ($parsedUri.Host -match '-pooler\.') {
+            return 'pooled endpoint'
+        }
+        if (-not $parsedUri.UserInfo.Contains(':')) {
+            return 'missing credential separator'
+        }
+        return $null
+    }
+    catch {
+        return 'invalid URI'
+    }
+}
+
 function ConvertFrom-SafeMigrationOutput {
     param([AllowNull()][string]$CapturedText)
 
@@ -243,21 +270,10 @@ public static class MemoryAtlasHiddenInput
     $secret = [MemoryAtlasHiddenInput]::ReadLineHidden()
 
     $currentStage = 'URI validation'
-    try {
-        $uri = [System.Uri]$secret
-    }
-    catch {
-        throw 'The entered value is not a valid PostgreSQL URI.'
-    }
-
-    if (
-        -not $uri.IsAbsoluteUri -or
-        $uri.Scheme -notin @('postgres', 'postgresql') -or
-        $uri.Host -notmatch '\.neon\.tech$' -or
-        $uri.Host -match '-pooler' -or
-        -not $uri.UserInfo.Contains(':')
-    ) {
-        throw 'Enter a direct Neon PostgreSQL URI. Migration was not started.'
+    $uriRejectionCategory = Get-NeonUriRejectionCategory -Value $secret
+    if ($null -ne $uriRejectionCategory) {
+        Write-Host ("Migration not started. URI validation rejected: {0}." -f $uriRejectionCategory)
+        return
     }
 
     # The URI is never passed in process arguments. The migration tool checks
