@@ -9,8 +9,11 @@ from unittest.mock import patch
 
 from scripts.migrate_sqlite_to_postgres import (
     TABLE_DEFINITIONS,
+    _migration_phase,
+    _migration_transaction,
     build_insert_query,
     extract_sqlite_table_data,
+    format_safe_failure,
     get_pg_table_counts,
     open_sqlite_readonly,
     run_migration,
@@ -103,6 +106,138 @@ class FakePostgresEngine:
             self.commits += 1
 
 
+class FakeDriverError(Exception):
+    sqlstate = "08006"
+
+
+class FakeSqlAlchemyError(Exception):
+    def __init__(self):
+        self.orig = FakeDriverError(
+            "postgresql://fake_user:fake_password@fake-host.test/neondb?sslmode=require&token=fake_token"
+        )
+        super().__init__(
+            "connection failed for postgresql://fake_user:fake_password@fake-host.test/neondb"
+            "?sslmode=require&token=fake_token"
+        )
+
+
+class FakeTransactionContext:
+    def __init__(self, fail_acquisition=False, fail_commit=False, fail_rollback=False):
+        self.fail_acquisition = fail_acquisition
+        self.fail_commit = fail_commit
+        self.fail_rollback = fail_rollback
+        self.rollback_calls = 0
+        self.commit_calls = 0
+
+    def __enter__(self):
+        if self.fail_acquisition:
+            raise RuntimeError("fake acquisition failure with password=fake_password")
+        return object()
+
+    def __exit__(self, exc_type, exc, traceback):
+        if exc_type is not None:
+            self.rollback_calls += 1
+            if self.fail_rollback:
+                raise RuntimeError("rollback failed for fake_user:fake_password@fake-host.test")
+            return False
+        self.commit_calls += 1
+        if self.fail_commit:
+            raise RuntimeError("fake commit failure for fake-host.test")
+        return False
+
+
+class FakeTransactionEngine:
+    def __init__(self, transaction_context):
+        self.transaction_context = transaction_context
+
+    def begin(self):
+        return self.transaction_context
+
+
+class MigrationDiagnosticTests(unittest.TestCase):
+    def test_phase_context_assigns_all_migration_operation_phases(self):
+        phases = (
+            "PostgreSQL connection / initial count check",
+            "Schema initialization",
+            "Table locking and destination recheck",
+            "Data insertion",
+            "Sequence reset",
+            "Final row-count verification",
+            "Post-commit reporting",
+        )
+        for phase in phases:
+            with self.subTest(phase=phase):
+                with self.assertRaisesRegex(RuntimeError, "synthetic failure") as raised:
+                    with _migration_phase(phase):
+                        raise RuntimeError("synthetic failure with fake_password")
+                diagnostic = format_safe_failure(raised.exception)
+                self.assertIn(f"phase={phase}", diagnostic)
+                self.assertNotIn("fake_password", diagnostic)
+
+    def test_transaction_acquisition_failure_gets_its_own_phase(self):
+        engine = FakeTransactionEngine(FakeTransactionContext(fail_acquisition=True))
+
+        with self.assertRaisesRegex(RuntimeError, "fake acquisition failure") as raised:
+            with _migration_transaction(engine):
+                self.fail("transaction body must not run")
+
+        diagnostic = format_safe_failure(raised.exception)
+        self.assertIn("phase=PostgreSQL transaction acquisition", diagnostic)
+        self.assertNotIn("fake_password", diagnostic)
+
+    def test_transaction_commit_failure_gets_its_own_phase(self):
+        transaction = FakeTransactionContext(fail_commit=True)
+        engine = FakeTransactionEngine(transaction)
+
+        with self.assertRaisesRegex(RuntimeError, "fake commit failure") as raised:
+            with _migration_transaction(engine):
+                pass
+
+        diagnostic = format_safe_failure(raised.exception)
+        self.assertIn("phase=PostgreSQL transaction commit", diagnostic)
+        self.assertNotIn("fake-host.test", diagnostic)
+        self.assertEqual(transaction.commit_calls, 1)
+
+    def test_transaction_body_failure_rolls_back_and_keeps_operation_phase(self):
+        transaction = FakeTransactionContext()
+        engine = FakeTransactionEngine(transaction)
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic insert failure") as raised:
+            with _migration_transaction(engine):
+                with _migration_phase("Data insertion"):
+                    raise RuntimeError("synthetic insert failure")
+
+        self.assertEqual(transaction.rollback_calls, 1)
+        self.assertEqual(transaction.commit_calls, 0)
+        self.assertIn("phase=Data insertion", format_safe_failure(raised.exception))
+
+    def test_rollback_failure_keeps_original_operation_failure_primary(self):
+        transaction = FakeTransactionContext(fail_rollback=True)
+        engine = FakeTransactionEngine(transaction)
+        operation_error = RuntimeError("operation failed with operation-secret")
+
+        with self.assertLogs("migration", level="ERROR") as captured_logs:
+            with self.assertRaises(RuntimeError) as raised:
+                with _migration_transaction(engine):
+                    with _migration_phase("Data insertion"):
+                        raise operation_error
+
+        self.assertIs(raised.exception, operation_error)
+        self.assertEqual(transaction.rollback_calls, 1)
+        self.assertEqual(transaction.commit_calls, 0)
+        primary_diagnostic = format_safe_failure(raised.exception)
+        self.assertIn("phase=Data insertion", primary_diagnostic)
+        self.assertIn("exception_type=RuntimeError", primary_diagnostic)
+        self.assertNotIn("operation-secret", primary_diagnostic)
+
+        rollback_diagnostic = " ".join(captured_logs.output)
+        self.assertIn("Rollback failed", rollback_diagnostic)
+        self.assertIn("exception_type=RuntimeError", rollback_diagnostic)
+        self.assertIn("Rollback failure details redacted.", rollback_diagnostic)
+        for sensitive in ("fake_user", "fake_password", "fake-host.test", "operation-secret"):
+            self.assertNotIn(sensitive, rollback_diagnostic)
+
+
 class MigrationUnitTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -127,6 +262,31 @@ class MigrationUnitTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_safe_failure_diagnostic_redacts_fake_connection_details(self):
+        diagnostic = format_safe_failure(FakeSqlAlchemyError(), "Schema initialization")
+
+        self.assertIn("exception_type=FakeSqlAlchemyError", diagnostic)
+        self.assertIn("sqlstate=08006", diagnostic)
+        self.assertIn("phase=Schema initialization", diagnostic)
+        self.assertIn("PostgreSQL schema initialization failed; details redacted.", diagnostic)
+        for secret_fragment in (
+            "fake_user", "fake_password", "fake-host.test", "neondb",
+            "sslmode", "token", "fake_token", "postgresql://",
+        ):
+            self.assertNotIn(secret_fragment, diagnostic)
+
+    def test_safe_failure_diagnostic_omits_invalid_sqlstate(self):
+        error = RuntimeError("password=fake_password; host=fake-host.test")
+        error.sqlstate = "not-a-sqlstate"
+
+        diagnostic = format_safe_failure(error, "Data insertion")
+
+        self.assertIn("exception_type=RuntimeError", diagnostic)
+        self.assertIn("sqlstate=unavailable", diagnostic)
+        self.assertIn("phase=Data insertion", diagnostic)
+        self.assertNotIn("fake_password", diagnostic)
+        self.assertNotIn("fake-host.test", diagnostic)
 
     def test_insert_query_never_uses_conflict_updates_or_ignores(self):
         user_def = next(d for d in TABLE_DEFINITIONS if d["table"] == "users")
@@ -192,13 +352,36 @@ class MigrationUnitTests(unittest.TestCase):
     def test_duplicate_id_insert_failure_rolls_back_schema_and_rows(self):
         engine = FakePostgresEngine(fail_insert=True)
         with patch("scripts.migrate_sqlite_to_postgres.get_pg_engine", return_value=engine):
-            with self.assertRaisesRegex(RuntimeError, "duplicate key"):
+            with self.assertRaisesRegex(RuntimeError, "duplicate key") as raised:
                 run_migration(self.sqlite_path, "postgresql+pg8000://user:pass@host/db", apply=True)
         self.assertEqual(engine.commits, 0)
         self.assertEqual(engine.rollbacks, 1)
+        self.assertEqual(raised.exception.migration_phase, "Data insertion")
         self.assertEqual(engine.connection.tables, set())
         self.assertEqual(engine.connection.counts, {})
         self.assertEqual(engine.connection.ddl, [])
+
+    def test_post_commit_reporting_failure_is_not_reported_as_rollback(self):
+        engine = FakePostgresEngine()
+
+        def fail_post_commit_report(message, *args):
+            if message == "================ VERIFICATION ================":
+                raise RuntimeError("synthetic reporting failure with fake detail")
+
+        with patch("scripts.migrate_sqlite_to_postgres.get_pg_engine", return_value=engine), \
+             patch("scripts.migrate_sqlite_to_postgres.logger.info", side_effect=fail_post_commit_report):
+            with self.assertRaisesRegex(RuntimeError, "synthetic reporting failure") as raised:
+                run_migration(
+                    self.sqlite_path, "postgresql+pg8000://user:pass@host/db", apply=True
+                )
+
+        self.assertEqual(engine.commits, 1)
+        self.assertEqual(engine.rollbacks, 0)
+        self.assertEqual(raised.exception.migration_phase, "Post-commit reporting")
+        diagnostic = format_safe_failure(raised.exception)
+        self.assertIn("phase=Post-commit reporting", diagnostic)
+        self.assertIn("transaction committed", diagnostic)
+        self.assertNotIn("synthetic reporting failure", diagnostic)
 
     def test_successful_migration_commits_verified_rows(self):
         engine = FakePostgresEngine()

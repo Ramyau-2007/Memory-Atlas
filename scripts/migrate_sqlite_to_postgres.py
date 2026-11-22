@@ -7,8 +7,10 @@ invitations, and sessions without modifying the original SQLite database.
 import argparse
 import logging
 import os
+import re
 import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 # Add project root to path
@@ -20,12 +22,86 @@ from app.db import (
     get_pg_engine,
     init_postgres_db,
     is_postgres_target,
-    normalize_pg_url,
 )
 from sqlalchemy import text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("migration")
+
+_PHASE_MESSAGES = {
+    "SQLite source preparation": "SQLite source preparation failed; details redacted.",
+    "PostgreSQL connection / initial count check": "PostgreSQL connection or initial count check failed; connection details redacted.",
+    "PostgreSQL transaction acquisition": "PostgreSQL transaction acquisition failed; connection details redacted.",
+    "Schema initialization": "PostgreSQL schema initialization failed; details redacted.",
+    "Table locking and destination recheck": "PostgreSQL table locking or destination recheck failed; details redacted.",
+    "Data insertion": "PostgreSQL data insertion failed; details redacted.",
+    "Sequence reset": "PostgreSQL sequence reset failed; details redacted.",
+    "Final row-count verification": "Final PostgreSQL row-count verification failed; details redacted.",
+    "PostgreSQL transaction commit": "PostgreSQL transaction commit failed; details redacted.",
+    "Post-commit reporting": "PostgreSQL transaction committed, but success reporting failed; inspect the destination before retrying.",
+}
+
+
+@contextmanager
+def _migration_phase(phase: str):
+    """Attach a safe phase label to a failing exception without changing it."""
+    try:
+        yield
+    except Exception as exc:
+        if not hasattr(exc, "migration_phase"):
+            try:
+                exc.migration_phase = phase
+            except Exception:
+                pass
+        raise
+
+
+@contextmanager
+def _migration_transaction(engine):
+    """Keep one engine transaction while tagging acquisition and commit failures separately."""
+    with _migration_phase("PostgreSQL transaction acquisition"):
+        transaction_context = engine.begin()
+        connection = transaction_context.__enter__()
+
+    try:
+        yield connection
+    except BaseException:
+        operation_exc_info = sys.exc_info()
+        try:
+            transaction_context.__exit__(*operation_exc_info)
+        except BaseException as rollback_exc:
+            # Keep the operation failure primary. Never format the rollback exception.
+            try:
+                logger.error(
+                    "Rollback failed; exception_type=%s; diagnostic=Rollback failure details redacted.",
+                    type(rollback_exc).__name__,
+                )
+            except Exception:
+                pass
+        raise
+    else:
+        with _migration_phase("PostgreSQL transaction commit"):
+            transaction_context.__exit__(None, None, None)
+
+
+def format_safe_failure(exc: Exception, phase: str | None = None) -> str:
+    """Format an allowlisted diagnostic; never include exception text or traceback."""
+    phase = phase or getattr(exc, "migration_phase", "SQLite source preparation")
+    if phase not in _PHASE_MESSAGES:
+        phase = "SQLite source preparation"
+
+    sqlstate = None
+    driver_error = getattr(exc, "orig", exc)
+    for candidate in (getattr(driver_error, "sqlstate", None), getattr(driver_error, "pgcode", None),
+                      getattr(exc, "sqlstate", None), getattr(exc, "pgcode", None)):
+        if isinstance(candidate, str) and re.fullmatch(r"[0-9A-Z]{5}", candidate):
+            sqlstate = candidate
+            break
+
+    return (
+        f"Migration failed phase={phase}; exception_type={type(exc).__name__}; "
+        f"sqlstate={sqlstate or 'unavailable'}; diagnostic={_PHASE_MESSAGES[phase]}"
+    )
 
 TABLE_DEFINITIONS = [
     {
@@ -191,33 +267,33 @@ class _MigrationConnectionAdapter:
 
 
 def run_migration(sqlite_path: str, pg_url: str, apply: bool = False) -> dict:
-    sqlite_conn = open_sqlite_readonly(sqlite_path)
-    try:
-        source_tables = {row[0] for row in sqlite_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        required_source_tables = {"users", "sessions", "conversations", "messages", "memories"}
-        if not required_source_tables.issubset(source_tables):
-            missing = sorted(required_source_tables - source_tables)
-            raise RuntimeError(f"SQLite source is missing required application tables: {missing}")
-        sqlite_data = {}
-        sqlite_counts = {}
-        for tdef in TABLE_DEFINITIONS:
-            table = tdef["table"]
-            rows = extract_sqlite_table_data(sqlite_conn, table, tdef["columns"])
-            sqlite_data[table] = rows
-            sqlite_counts[table] = len(rows)
-    finally:
-        sqlite_conn.close()
+    with _migration_phase("SQLite source preparation"):
+        sqlite_conn = open_sqlite_readonly(sqlite_path)
+        try:
+            source_tables = {row[0] for row in sqlite_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            required_source_tables = {"users", "sessions", "conversations", "messages", "memories"}
+            if not required_source_tables.issubset(source_tables):
+                missing = sorted(required_source_tables - source_tables)
+                raise RuntimeError(f"SQLite source is missing required application tables: {missing}")
+            sqlite_data = {}
+            sqlite_counts = {}
+            for tdef in TABLE_DEFINITIONS:
+                table = tdef["table"]
+                rows = extract_sqlite_table_data(sqlite_conn, table, tdef["columns"])
+                sqlite_data[table] = rows
+                sqlite_counts[table] = len(rows)
+        finally:
+            sqlite_conn.close()
 
-    engine = get_pg_engine(pg_url)
-
-    # 2. Check initial target counts
-    initial_pg_counts = get_pg_table_counts(engine)
+    with _migration_phase("PostgreSQL connection / initial count check"):
+        engine = get_pg_engine(pg_url)
+        initial_pg_counts = get_pg_table_counts(engine)
 
     logger.info("================ MIGRATION SUMMARY ================")
-    logger.info("SQLite Database: %s", Path(sqlite_path).resolve())
-    logger.info("Target: PostgreSQL (%s)", normalize_pg_url(pg_url).split("@")[-1])
+    logger.info("Source: local SQLite database")
+    logger.info("Target: external PostgreSQL")
     logger.info("Mode: %s", "APPLY (Writing changes)" if apply else "DRY-RUN (Inspection only)")
     logger.info("---------------------------------------------------")
     logger.info("%-20s %-15s %-15s", "Table", "SQLite Rows", "Current PG Rows")
@@ -227,11 +303,12 @@ def run_migration(sqlite_path: str, pg_url: str, apply: bool = False) -> dict:
         logger.info("%-20s %-15d %-15d", table, sqlite_counts[table], initial_pg_counts.get(table, 0))
     logger.info("---------------------------------------------------")
 
-    if apply and any(initial_pg_counts.values()):
-        raise RuntimeError(
-            "Destination PostgreSQL database contains existing Memory Atlas data; refusing migration. "
-            "Use a new empty database."
-        )
+    with _migration_phase("PostgreSQL connection / initial count check"):
+        if apply and any(initial_pg_counts.values()):
+            raise RuntimeError(
+                "Destination PostgreSQL database contains existing Memory Atlas data; refusing migration. "
+                "Use a new empty database."
+            )
 
     if not apply:
         logger.info("DRY RUN completed. No database changes were made.")
@@ -246,52 +323,60 @@ def run_migration(sqlite_path: str, pg_url: str, apply: bool = False) -> dict:
     # transaction. Table locks close the gap between the initial read-only
     # preflight and writes, including races with a concurrently starting app.
     logger.info("Initializing / verifying PostgreSQL schema transactionally...")
-    with engine.begin() as conn:
-        init_postgres_db(_MigrationConnectionAdapter(conn))
-        table_list = ", ".join(tdef["table"] for tdef in TABLE_DEFINITIONS)
-        conn.exec_driver_sql(f"LOCK TABLE {table_list} IN ACCESS EXCLUSIVE MODE")
-        locked_counts = _pg_table_counts(conn)
-        if any(locked_counts.values()):
-            raise RuntimeError(
-                "Destination PostgreSQL database contains existing Memory Atlas data; refusing migration. "
-                "Use a new empty database."
-            )
+    with _migration_transaction(engine) as conn:
+        with _migration_phase("Schema initialization"):
+            init_postgres_db(_MigrationConnectionAdapter(conn))
 
+        with _migration_phase("Table locking and destination recheck"):
+            table_list = ", ".join(tdef["table"] for tdef in TABLE_DEFINITIONS)
+            conn.exec_driver_sql(f"LOCK TABLE {table_list} IN ACCESS EXCLUSIVE MODE")
+            locked_counts = _pg_table_counts(conn)
+            if any(locked_counts.values()):
+                raise RuntimeError(
+                    "Destination PostgreSQL database contains existing Memory Atlas data; refusing migration. "
+                    "Use a new empty database."
+                )
+
+        with _migration_phase("Data insertion"):
+            for tdef in TABLE_DEFINITIONS:
+                table = tdef["table"]
+                rows = sqlite_data[table]
+                if not rows:
+                    continue
+                insert_sql = text(build_insert_query(tdef))
+                logger.info("Migrating %d row(s) into '%s'...", len(rows), table)
+                conn.execute(insert_sql, rows)
+
+        with _migration_phase("Sequence reset"):
+            logger.info("Synchronizing PostgreSQL sequences transactionally...")
+            reset_sequences(conn)
+
+        with _migration_phase("Final row-count verification"):
+            final_pg_counts = _pg_table_counts(conn)
+            if final_pg_counts != sqlite_counts:
+                raise RuntimeError(
+                    "Migration row-count verification failed; rolling back. "
+                    f"SQLite counts: {sqlite_counts}; PostgreSQL counts: {final_pg_counts}"
+                )
+    with _migration_phase("Post-commit reporting"):
+        logger.info("================ VERIFICATION ================")
+        logger.info("%-20s %-15s %-15s", "Table", "SQLite Rows", "Final PG Rows")
+        logger.info("---------------------------------------------------")
         for tdef in TABLE_DEFINITIONS:
             table = tdef["table"]
-            rows = sqlite_data[table]
-            if not rows:
-                continue
-            insert_sql = text(build_insert_query(tdef))
-            logger.info("Migrating %d row(s) into '%s'...", len(rows), table)
-            conn.execute(insert_sql, rows)
+            s_count = sqlite_counts[table]
+            p_count = final_pg_counts.get(table, 0)
+            match = "✓" if p_count >= s_count else "✗"
+            logger.info("%-20s %-15d %-15d %s", table, s_count, p_count, match)
+        logger.info("---------------------------------------------------")
+        logger.info("Migration completed successfully!")
 
-        logger.info("Synchronizing PostgreSQL sequences transactionally...")
-        reset_sequences(conn)
-        final_pg_counts = _pg_table_counts(conn)
-        if final_pg_counts != sqlite_counts:
-            raise RuntimeError(
-                "Migration row-count verification failed; rolling back. "
-                f"SQLite counts: {sqlite_counts}; PostgreSQL counts: {final_pg_counts}"
-            )
-    logger.info("================ VERIFICATION ================")
-    logger.info("%-20s %-15s %-15s", "Table", "SQLite Rows", "Final PG Rows")
-    logger.info("---------------------------------------------------")
-    for tdef in TABLE_DEFINITIONS:
-        table = tdef["table"]
-        s_count = sqlite_counts[table]
-        p_count = final_pg_counts.get(table, 0)
-        match = "✓" if p_count >= s_count else "✗"
-        logger.info("%-20s %-15d %-15d %s", table, s_count, p_count, match)
-    logger.info("---------------------------------------------------")
-    logger.info("Migration completed successfully!")
-
-    return {
-        "mode": "applied",
-        "sqlite_counts": sqlite_counts,
-        "initial_pg_counts": initial_pg_counts,
-        "final_pg_counts": final_pg_counts,
-    }
+        return {
+            "mode": "applied",
+            "sqlite_counts": sqlite_counts,
+            "initial_pg_counts": initial_pg_counts,
+            "final_pg_counts": final_pg_counts,
+        }
 
 
 def main():
@@ -314,17 +399,17 @@ def main():
     args = parser.parse_args()
 
     if not args.pg_url:
-        print("ERROR: PostgreSQL connection URL must be specified via --pg-url or DATABASE_URL env var.", file=sys.stderr)
+        print("ERROR: PostgreSQL connection URL is not configured.", file=sys.stderr)
         sys.exit(1)
 
     if not is_postgres_target(args.pg_url):
-        print(f"ERROR: Target URL '{args.pg_url}' is not a valid PostgreSQL URL.", file=sys.stderr)
+        print("ERROR: Target must be a PostgreSQL URL.", file=sys.stderr)
         sys.exit(1)
 
     try:
         run_migration(args.sqlite_path, args.pg_url, apply=args.apply)
     except Exception as exc:
-        logger.error("Migration failed: %s", exc, exc_info=True)
+        logger.error(format_safe_failure(exc))
         sys.exit(2)
 
 
