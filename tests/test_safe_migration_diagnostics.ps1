@@ -23,11 +23,54 @@ $displayFunction = $wrapperAst.Find({
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $node.Name -eq 'Show-SafeMigrationDiagnostics'
 }, $true)
-if ($null -eq $parserFunction -or $null -eq $displayFunction) {
+$outerFailureFunction = $wrapperAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Get-SafeOuterFailureMessage'
+}, $true)
+if ($null -eq $parserFunction -or $null -eq $displayFunction -or $null -eq $outerFailureFunction) {
     throw 'Safe diagnostic functions were not found.'
 }
 Invoke-Expression $parserFunction.Extent.Text
 Invoke-Expression $displayFunction.Extent.Text
+Invoke-Expression $outerFailureFunction.Extent.Text
+
+$wrapperSource = Get-Content -LiteralPath $wrapperPath -Raw
+$outerStages = @('setup', 'SQLite preflight', 'hidden URI input', 'URI validation', 'Python invocation', 'count reporting')
+foreach ($stageName in $outerStages) {
+    if ($wrapperSource -notmatch [regex]::Escape("`$currentStage = '$stageName'")) {
+        throw "Wrapper is missing stage tracking for $stageName."
+    }
+}
+$mayStartIndex = $wrapperSource.IndexOf('$migrationMayHaveStarted = $true', [System.StringComparison]::Ordinal)
+$invokeIndex = $wrapperSource.IndexOf('$migrationOutput = @(& $python -m scripts.migrate_sqlite_to_postgres', [System.StringComparison]::Ordinal)
+$nonzeroExitIndex = $wrapperSource.IndexOf('if ($migrationExitCode -ne 0)', [System.StringComparison]::Ordinal)
+$countStageIndex = $wrapperSource.IndexOf("`$currentStage = 'count reporting'", [System.StringComparison]::Ordinal)
+if ($mayStartIndex -lt 0 -or $invokeIndex -le $mayStartIndex -or
+    $nonzeroExitIndex -le $invokeIndex -or $countStageIndex -le $nonzeroExitIndex) {
+    throw 'Python-start and successful-exit count-reporting stages are not ordered safely.'
+}
+foreach ($stageName in @('setup', 'SQLite preflight', 'hidden URI input', 'URI validation')) {
+    $safeMessage = Get-SafeOuterFailureMessage -Stage $stageName -MigrationMayHaveStarted $false
+    if ($safeMessage -cne "Migration not started. Stage: $stageName.") {
+        throw "Pre-migration failure was not safely identified for stage $stageName."
+    }
+}
+Write-Output 'Synthetic setup, SQLite preflight, hidden URI input, and URI validation failure reporting: PASS'
+
+$pythonFailureMessage = Get-SafeOuterFailureMessage -Stage 'Python invocation' -MigrationMayHaveStarted $true
+if ($pythonFailureMessage -cne 'Migration may have started; inspect Neon counts before retrying. Stage: Python invocation.') {
+    throw 'Python invocation failure was not classified as potentially started.'
+}
+$postExitReportFailureMessage = Get-SafeOuterFailureMessage -Stage 'count reporting' -MigrationMayHaveStarted $true
+if ($postExitReportFailureMessage -cne 'Migration may have started; inspect Neon counts before retrying. Stage: count reporting.') {
+    throw 'Count-reporting failure after process exit was not classified as potentially started.'
+}
+$unknownStageMessage = Get-SafeOuterFailureMessage -Stage 'raw exception / secret' -MigrationMayHaveStarted $false
+if ($unknownStageMessage -cne 'Migration not started. Stage: setup.') {
+    throw 'Unrecognized stage text was not replaced with the fixed setup label.'
+}
+Write-Output 'Synthetic Python invocation and post-exit count-reporting failure classification: PASS'
 
 $script:hostLines = New-Object 'System.Collections.Generic.List[string]'
 $script:failDisplayOnce = $false
@@ -162,5 +205,8 @@ function Invoke-WrapperPreferenceErrorPathTest {
 $restoredPreference = Invoke-WrapperPreferenceErrorPathTest -WrapperPath $wrapperPath
 if ($restoredPreference -cne 'Continue') {
     throw 'Wrapper did not restore the caller preference after its error path.'
+}
+if (-not $script:hostLines.Contains('Migration not started. Stage: setup.')) {
+    throw 'Actual setup error path did not report its fixed stage and not-started status.'
 }
 Write-Output 'Caller ErrorActionPreference restoration on synthetic error path: PASS'

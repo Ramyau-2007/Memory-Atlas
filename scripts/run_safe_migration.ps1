@@ -8,7 +8,32 @@ $originalLocation = $null
 $hadDatabaseUrl = $false
 $databaseUrlSnapshotCaptured = $false
 $previousDatabaseUrl = $null
-$migrationFailed = $false
+$currentStage = 'setup'
+$migrationMayHaveStarted = $false
+
+function Get-SafeOuterFailureMessage {
+    param(
+        [AllowNull()][string]$Stage,
+        [bool]$MigrationMayHaveStarted
+    )
+
+    $allowedStages = @(
+        'setup',
+        'SQLite preflight',
+        'hidden URI input',
+        'URI validation',
+        'Python invocation',
+        'count reporting'
+    )
+    if ($Stage -cnotin $allowedStages) {
+        $Stage = 'setup'
+    }
+
+    if ($MigrationMayHaveStarted) {
+        return "Migration may have started; inspect Neon counts before retrying. Stage: $Stage."
+    }
+    return "Migration not started. Stage: $Stage."
+}
 
 function ConvertFrom-SafeMigrationOutput {
     param([AllowNull()][string]$CapturedText)
@@ -141,6 +166,7 @@ function Show-SafeMigrationDiagnostics {
 try {
     $ErrorActionPreference = 'Stop'
 
+    $currentStage = 'setup'
     $projectRoot = Split-Path -Parent $PSScriptRoot
     $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
     $sqliteRelativePath = 'data/memory.sqlite3'
@@ -156,6 +182,8 @@ try {
     if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
         throw 'Project virtual-environment Python was not found.'
     }
+
+    $currentStage = 'SQLite preflight'
     if (-not (Test-Path -LiteralPath $sqliteRelativePath -PathType Leaf)) {
         throw 'The local SQLite source database was not found.'
     }
@@ -173,6 +201,7 @@ try {
     }
     Write-Host 'SQLite foreign-key check: 0 violations'
 
+    $currentStage = 'hidden URI input'
     if (-not ('MemoryAtlasHiddenInput' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -212,6 +241,8 @@ public static class MemoryAtlasHiddenInput
 
     Write-Host 'Enter the Neon DIRECT PostgreSQL URI (input is hidden):'
     $secret = [MemoryAtlasHiddenInput]::ReadLineHidden()
+
+    $currentStage = 'URI validation'
     try {
         $uri = [System.Uri]$secret
     }
@@ -231,12 +262,14 @@ public static class MemoryAtlasHiddenInput
 
     # The URI is never passed in process arguments. The migration tool checks
     # destination emptiness before writes and rechecks under locks in its transaction.
+    $currentStage = 'Python invocation'
     $databaseUrl = $secret
     $env:DATABASE_URL = $databaseUrl
     $previousErrorActionPreference = $ErrorActionPreference
     $migrationInvocationFailed = $false
     try {
         $ErrorActionPreference = 'Continue'
+        $migrationMayHaveStarted = $true
         $migrationOutput = @(& $python -m scripts.migrate_sqlite_to_postgres --sqlite-path $sqliteRelativePath --apply 2>&1)
         $migrationExitCode = $LASTEXITCODE
     }
@@ -249,9 +282,8 @@ public static class MemoryAtlasHiddenInput
     }
 
     if ($migrationInvocationFailed) {
-        $migrationFailed = $true
         Write-Host 'Safe diagnostic stage failed: Python output capture.'
-        Write-Host 'Migration status could not be determined. Inspect Neon counts before retrying.'
+        Write-Host (Get-SafeOuterFailureMessage -Stage $currentStage -MigrationMayHaveStarted $migrationMayHaveStarted)
         return
     }
 
@@ -259,18 +291,17 @@ public static class MemoryAtlasHiddenInput
         $rawOutput = ($migrationOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
     }
     catch {
-        $migrationFailed = $true
         Write-Host 'Safe diagnostic stage failed: Python output capture.'
-        Write-Host 'Migration status could not be determined. Inspect Neon counts before retrying.'
+        Write-Host (Get-SafeOuterFailureMessage -Stage $currentStage -MigrationMayHaveStarted $migrationMayHaveStarted)
         return
     }
 
     if ($migrationExitCode -ne 0) {
-        $migrationFailed = $true
         Show-SafeMigrationDiagnostics -CapturedText $rawOutput
         return
     }
 
+    $currentStage = 'count reporting'
     $counts = @{}
     $countPattern = '\[INFO\]\s+(users|invitations|sessions|conversations|messages|memories|memory_versions|temporary_context|memory_events)\s+(\d+)\s+(\d+)(?:\s|$)'
     foreach ($outputLine in ($rawOutput -split "`r?`n")) {
@@ -301,12 +332,7 @@ public static class MemoryAtlasHiddenInput
 }
 catch {
     # Never print exception details, native output, or anything that might contain a URI.
-    if ($migrationFailed) {
-        Write-Host 'Migration status could not be determined. Inspect Neon counts before retrying.'
-    }
-    else {
-        Write-Host 'Safe migration stopped before completion. No raw diagnostics were displayed.'
-    }
+    Write-Host (Get-SafeOuterFailureMessage -Stage $currentStage -MigrationMayHaveStarted $migrationMayHaveStarted)
 }
 finally {
     try {
