@@ -25,8 +25,14 @@ function ConvertFrom-SafeMigrationOutput {
         'PostgreSQL transaction commit' = 'PostgreSQL transaction commit failed; details redacted.'
         'Post-commit reporting' = 'PostgreSQL transaction committed, but success reporting failed; inspect the destination before retrying.'
     }
+    $sequenceSubphaseMessages = @{
+        'Sequence lookup using pg_get_serial_sequence' = 'PostgreSQL serial sequence lookup failed; details redacted.'
+        'Maximum primary-key ID query' = 'PostgreSQL maximum primary-key ID query failed; details redacted.'
+        'ALTER SEQUENCE statement generation' = 'PostgreSQL ALTER SEQUENCE statement generation failed; details redacted.'
+        'ALTER SEQUENCE execution' = 'PostgreSQL ALTER SEQUENCE execution failed; details redacted.'
+    }
     $timestampPrefix = '(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[ERROR\] )?'
-    $primaryPattern = '^' + $timestampPrefix + 'Migration failed phase=(?<phase>[^;\r\n]+); exception_type=(?<exception>[A-Za-z_][A-Za-z0-9_]{0,63}); sqlstate=(?<sqlstate>[^;\r\n]+); diagnostic=(?<message>[^\r\n]+)$'
+    $primaryPattern = '^' + $timestampPrefix + 'Migration failed phase=(?<phase>[^;\r\n]+); (?:subphase=(?<subphase>[^;\r\n]+); )?exception_type=(?<exception>[A-Za-z_][A-Za-z0-9_]{0,63}); sqlstate=(?<sqlstate>[^;\r\n]+); diagnostic=(?<message>[^\r\n]+)$'
     $rollbackPattern = '^' + $timestampPrefix + 'Rollback failed; exception_type=(?<exception>[A-Za-z_][A-Za-z0-9_]{0,63}); diagnostic=(?<message>[^\r\n]+)$'
     $lines = @($CapturedText -split "`r?`n")
     $primaryCandidates = @($lines | Where-Object { $_ -match 'Migration failed phase=' })
@@ -40,10 +46,20 @@ function ConvertFrom-SafeMigrationOutput {
     }
 
     $phase = $Matches['phase']
+    $subphase = $Matches['subphase']
     $exceptionClass = $Matches['exception']
     $sqlState = $Matches['sqlstate']
     $message = $Matches['message']
-    if (-not $phaseMessages.ContainsKey($phase) -or $message -cne $phaseMessages[$phase]) {
+    if (-not $phaseMessages.ContainsKey($phase)) {
+        return $null
+    }
+    if ($subphase) {
+        if ($phase -cne 'Sequence reset' -or -not $sequenceSubphaseMessages.ContainsKey($subphase) -or
+            $message -cne $sequenceSubphaseMessages[$subphase]) {
+            return $null
+        }
+    }
+    elseif ($message -cne $phaseMessages[$phase]) {
         return $null
     }
     if ($sqlState -cne 'unavailable' -and $sqlState -cnotmatch '^[0-9A-Z]{5}$') {
@@ -68,6 +84,7 @@ function ConvertFrom-SafeMigrationOutput {
 
     return [pscustomobject]@{
         Phase = $phase
+        Subphase = $subphase
         ExceptionClass = $exceptionClass
         SqlState = if ($sqlState -ceq 'unavailable') { $null } else { $sqlState }
         Message = $message
@@ -99,6 +116,9 @@ function Show-SafeMigrationDiagnostics {
             Write-Host 'Migration process failed before confirmed commit. Inspect Neon counts before retrying.'
         }
         Write-Host ('Migration phase: {0}' -f $safeDiagnostics.Phase)
+        if ($safeDiagnostics.Subphase) {
+            Write-Host ('Migration subphase: {0}' -f $safeDiagnostics.Subphase)
+        }
         Write-Host ('Exception class: {0}' -f $safeDiagnostics.ExceptionClass)
         if ($safeDiagnostics.SqlState) {
             Write-Host ('SQLSTATE: {0}' -f $safeDiagnostics.SqlState)

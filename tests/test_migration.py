@@ -6,6 +6,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
+from sqlalchemy.exc import ProgrammingError
 
 from scripts.migrate_sqlite_to_postgres import (
     TABLE_DEFINITIONS,
@@ -33,13 +34,18 @@ class FakeResult:
         return self.value
 
 
+class FakeProgrammingDriverError(Exception):
+    sqlstate = "42601"
+
+
 class FakePostgresConnection:
-    def __init__(self, tables=None, counts=None, fail_count=False, fail_insert=False):
+    def __init__(self, tables=None, counts=None, fail_count=False, fail_insert=False, fail_sequence_subphase=None):
         self.tables = set(tables or ())
         self.counts = {name: 0 for name in self.tables}
         self.counts.update(counts or {})
         self.fail_count = fail_count
         self.fail_insert = fail_insert
+        self.fail_sequence_subphase = fail_sequence_subphase
         self.ddl = []
         self.locked = False
 
@@ -53,11 +59,17 @@ class FakePostgresConnection:
                 raise RuntimeError("simulated PostgreSQL count query failure")
             return FakeResult(value=self.counts.get(match.group(1), 0))
         if "pg_get_serial_sequence" in sql:
-            return FakeResult(value="public.test_sequence")
+            if self.fail_sequence_subphase == "Sequence lookup using pg_get_serial_sequence":
+                self._raise_sequence_programming_error()
+            return FakeResult(value=f"public.{params['table_name']}_{params['column_name']}_seq")
         if "COALESCE(MAX(" in sql:
+            if self.fail_sequence_subphase == "Maximum primary-key ID query":
+                self._raise_sequence_programming_error()
             return FakeResult(value=2)
         if "ALTER SEQUENCE" in sql and "format(" in sql:
-            return FakeResult(value="ALTER SEQUENCE public.test_sequence RESTART WITH 2")
+            if self.fail_sequence_subphase == "ALTER SEQUENCE statement generation":
+                self._raise_sequence_programming_error()
+            return FakeResult(value=f"ALTER SEQUENCE {params['sequence_name']} RESTART WITH {params['next_value']}")
         match = re.match(r"INSERT INTO (\w+)", sql)
         if match:
             if self.fail_insert:
@@ -66,8 +78,18 @@ class FakePostgresConnection:
             return FakeResult()
         raise AssertionError(f"Unexpected SQL in migration test: {sql}")
 
+    @staticmethod
+    def _raise_sequence_programming_error():
+        raise ProgrammingError(
+            "synthetic sequence SQL failure",
+            {},
+            FakeProgrammingDriverError("synthetic fake SQL detail"),
+        )
+
     def exec_driver_sql(self, statement):
         self.ddl.append(statement)
+        if statement.startswith("ALTER SEQUENCE") and self.fail_sequence_subphase == "ALTER SEQUENCE execution":
+            self._raise_sequence_programming_error()
         match = re.match(r"CREATE TABLE IF NOT EXISTS (\w+)", statement)
         if match:
             self.tables.add(match.group(1))
@@ -78,8 +100,10 @@ class FakePostgresConnection:
 
 
 class FakePostgresEngine:
-    def __init__(self, tables=None, counts=None, fail_count=False, fail_insert=False):
-        self.connection = FakePostgresConnection(tables, counts, fail_count, fail_insert)
+    def __init__(self, tables=None, counts=None, fail_count=False, fail_insert=False, fail_sequence_subphase=None):
+        self.connection = FakePostgresConnection(
+            tables, counts, fail_count, fail_insert, fail_sequence_subphase
+        )
         self.begin_calls = 0
         self.commits = 0
         self.rollbacks = 0
@@ -266,7 +290,7 @@ class MigrationUnitTests(unittest.TestCase):
     def test_safe_failure_diagnostic_redacts_fake_connection_details(self):
         diagnostic = format_safe_failure(FakeSqlAlchemyError(), "Schema initialization")
 
-        self.assertIn("exception_type=FakeSqlAlchemyError", diagnostic)
+        self.assertIn("exception_type=UnexpectedError", diagnostic)
         self.assertIn("sqlstate=08006", diagnostic)
         self.assertIn("phase=Schema initialization", diagnostic)
         self.assertIn("PostgreSQL schema initialization failed; details redacted.", diagnostic)
@@ -285,6 +309,18 @@ class MigrationUnitTests(unittest.TestCase):
         self.assertIn("exception_type=RuntimeError", diagnostic)
         self.assertIn("sqlstate=unavailable", diagnostic)
         self.assertIn("phase=Data insertion", diagnostic)
+        self.assertNotIn("fake_password", diagnostic)
+        self.assertNotIn("fake-host.test", diagnostic)
+
+    def test_dynamic_exception_class_name_is_not_reported(self):
+        sensitive_class_name = "credential_fake_password_host_fake-host"
+        dynamic_error_type = type(sensitive_class_name, (Exception,), {})
+        error = dynamic_error_type("password=fake_password host=fake-host.test")
+
+        diagnostic = format_safe_failure(error, "Data insertion")
+
+        self.assertIn("exception_type=UnexpectedError", diagnostic)
+        self.assertNotIn(sensitive_class_name, diagnostic)
         self.assertNotIn("fake_password", diagnostic)
         self.assertNotIn("fake-host.test", diagnostic)
 
@@ -383,6 +419,37 @@ class MigrationUnitTests(unittest.TestCase):
         self.assertIn("transaction committed", diagnostic)
         self.assertNotIn("synthetic reporting failure", diagnostic)
 
+    def test_sequence_reset_programming_errors_report_each_subphase_and_roll_back(self):
+        subphases = (
+            "Sequence lookup using pg_get_serial_sequence",
+            "Maximum primary-key ID query",
+            "ALTER SEQUENCE statement generation",
+            "ALTER SEQUENCE execution",
+        )
+        for subphase in subphases:
+            with self.subTest(subphase=subphase):
+                engine = FakePostgresEngine(fail_sequence_subphase=subphase)
+                with patch("scripts.migrate_sqlite_to_postgres.get_pg_engine", return_value=engine):
+                    with self.assertRaises(ProgrammingError) as raised:
+                        run_migration(
+                            self.sqlite_path,
+                            "postgresql+pg8000://user:pass@host/db",
+                            apply=True,
+                        )
+
+                self.assertEqual(raised.exception.migration_phase, "Sequence reset")
+                self.assertEqual(raised.exception.migration_subphase, subphase)
+                diagnostic = format_safe_failure(raised.exception)
+                self.assertIn("phase=Sequence reset", diagnostic)
+                self.assertIn(f"subphase={subphase}", diagnostic)
+                self.assertIn("exception_type=ProgrammingError", diagnostic)
+                self.assertIn("sqlstate=42601", diagnostic)
+                self.assertNotIn("synthetic fake SQL detail", diagnostic)
+                self.assertEqual(engine.commits, 0)
+                self.assertEqual(engine.rollbacks, 1)
+                self.assertEqual(engine.connection.tables, set())
+                self.assertEqual(engine.connection.ddl, [])
+
     def test_successful_migration_commits_verified_rows(self):
         engine = FakePostgresEngine()
         with patch("scripts.migrate_sqlite_to_postgres.get_pg_engine", return_value=engine):
@@ -392,6 +459,12 @@ class MigrationUnitTests(unittest.TestCase):
         self.assertEqual(engine.rollbacks, 0)
         self.assertTrue(engine.connection.locked)
         self.assertEqual(engine.connection.counts, result["sqlite_counts"])
+        sequence_resets = [
+            statement for statement in engine.connection.ddl
+            if statement.startswith("ALTER SEQUENCE")
+        ]
+        self.assertEqual(len(sequence_resets), 7)
+        self.assertTrue(all(statement.endswith("RESTART WITH 2") for statement in sequence_resets))
 
 
 if __name__ == "__main__":

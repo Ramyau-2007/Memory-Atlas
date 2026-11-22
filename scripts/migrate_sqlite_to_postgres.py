@@ -24,6 +24,14 @@ from app.db import (
     is_postgres_target,
 )
 from sqlalchemy import text
+from sqlalchemy.exc import (
+    DBAPIError,
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+    ProgrammingError,
+    SQLAlchemyError,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("migration")
@@ -40,6 +48,32 @@ _PHASE_MESSAGES = {
     "PostgreSQL transaction commit": "PostgreSQL transaction commit failed; details redacted.",
     "Post-commit reporting": "PostgreSQL transaction committed, but success reporting failed; inspect the destination before retrying.",
 }
+_SEQUENCE_SUBPHASE_MESSAGES = {
+    "Sequence lookup using pg_get_serial_sequence": "PostgreSQL serial sequence lookup failed; details redacted.",
+    "Maximum primary-key ID query": "PostgreSQL maximum primary-key ID query failed; details redacted.",
+    "ALTER SEQUENCE statement generation": "PostgreSQL ALTER SEQUENCE statement generation failed; details redacted.",
+    "ALTER SEQUENCE execution": "PostgreSQL ALTER SEQUENCE execution failed; details redacted.",
+}
+_SAFE_EXCEPTION_TYPES = {
+    AssertionError: "AssertionError",
+    DBAPIError: "DBAPIError",
+    IntegrityError: "IntegrityError",
+    InterfaceError: "InterfaceError",
+    KeyError: "KeyError",
+    OperationalError: "OperationalError",
+    OSError: "OSError",
+    ProgrammingError: "ProgrammingError",
+    RuntimeError: "RuntimeError",
+    SQLAlchemyError: "SQLAlchemyError",
+    sqlite3.Error: "SQLiteError",
+    TypeError: "TypeError",
+    ValueError: "ValueError",
+}
+
+
+def _safe_exception_type_name(exc: BaseException) -> str:
+    """Return a fixed class label; never expose dynamically chosen type names."""
+    return _SAFE_EXCEPTION_TYPES.get(type(exc), "UnexpectedError")
 
 
 @contextmanager
@@ -51,6 +85,20 @@ def _migration_phase(phase: str):
         if not hasattr(exc, "migration_phase"):
             try:
                 exc.migration_phase = phase
+            except Exception:
+                pass
+        raise
+
+
+@contextmanager
+def _migration_subphase(subphase: str):
+    """Attach a validated sequence-reset subphase without replacing the outer phase."""
+    try:
+        yield
+    except Exception as exc:
+        if not hasattr(exc, "migration_subphase"):
+            try:
+                exc.migration_subphase = subphase
             except Exception:
                 pass
         raise
@@ -74,7 +122,7 @@ def _migration_transaction(engine):
             try:
                 logger.error(
                     "Rollback failed; exception_type=%s; diagnostic=Rollback failure details redacted.",
-                    type(rollback_exc).__name__,
+                    _safe_exception_type_name(rollback_exc),
                 )
             except Exception:
                 pass
@@ -98,9 +146,14 @@ def format_safe_failure(exc: Exception, phase: str | None = None) -> str:
             sqlstate = candidate
             break
 
+    subphase = getattr(exc, "migration_subphase", None)
+    if subphase not in _SEQUENCE_SUBPHASE_MESSAGES or phase != "Sequence reset":
+        subphase = None
+    diagnostic = _SEQUENCE_SUBPHASE_MESSAGES[subphase] if subphase else _PHASE_MESSAGES[phase]
+    subphase_field = f"; subphase={subphase}" if subphase else ""
     return (
-        f"Migration failed phase={phase}; exception_type={type(exc).__name__}; "
-        f"sqlstate={sqlstate or 'unavailable'}; diagnostic={_PHASE_MESSAGES[phase]}"
+        f"Migration failed phase={phase}{subphase_field}; exception_type={_safe_exception_type_name(exc)}; "
+        f"sqlstate={sqlstate or 'unavailable'}; diagnostic={diagnostic}"
     )
 
 TABLE_DEFINITIONS = [
@@ -236,25 +289,32 @@ def reset_sequences(conn) -> None:
         if not tdef["has_sequence"]:
             continue
         table, pk = tdef["table"], tdef["pk"]
-        sequence = conn.execute(text(
-            "SELECT pg_get_serial_sequence(:table_name, :column_name)"
-        ), {"table_name": table, "column_name": pk}).scalar()
-        if not sequence:
-            raise RuntimeError(f"PostgreSQL serial sequence is missing for {table}.{pk}.")
-        next_value = conn.execute(text(
-            f"SELECT COALESCE(MAX({pk}), 0) + 1 FROM {table}"
-        )).scalar()
-        if next_value is None:
-            raise RuntimeError(f"Could not determine the next sequence value for {table}.{pk}.")
-        alter_sequence = conn.execute(text("""
-            SELECT format(
-                'ALTER SEQUENCE %s RESTART WITH %s',
-                CAST(:sequence_name AS regclass), :next_value
-            )
-        """), {"sequence_name": sequence, "next_value": int(next_value)}).scalar()
-        if not alter_sequence:
-            raise RuntimeError(f"Could not prepare the sequence update for {table}.{pk}.")
-        conn.exec_driver_sql(alter_sequence)
+        with _migration_subphase("Sequence lookup using pg_get_serial_sequence"):
+            sequence = conn.execute(text(
+                "SELECT pg_get_serial_sequence(:table_name, :column_name)"
+            ), {"table_name": table, "column_name": pk}).scalar()
+            if not sequence:
+                raise RuntimeError(f"PostgreSQL serial sequence is missing for {table}.{pk}.")
+
+        with _migration_subphase("Maximum primary-key ID query"):
+            next_value = conn.execute(text(
+                f"SELECT COALESCE(MAX({pk}), 0) + 1 FROM {table}"
+            )).scalar()
+            if next_value is None:
+                raise RuntimeError(f"Could not determine the next sequence value for {table}.{pk}.")
+
+        with _migration_subphase("ALTER SEQUENCE statement generation"):
+            alter_sequence = conn.execute(text("""
+                SELECT format(
+                    'ALTER SEQUENCE %s RESTART WITH %s',
+                    CAST(:sequence_name AS regclass), :next_value
+                )
+            """), {"sequence_name": sequence, "next_value": int(next_value)}).scalar()
+            if not alter_sequence:
+                raise RuntimeError(f"Could not prepare the sequence update for {table}.{pk}.")
+
+        with _migration_subphase("ALTER SEQUENCE execution"):
+            conn.exec_driver_sql(alter_sequence)
 
 
 class _MigrationConnectionAdapter:

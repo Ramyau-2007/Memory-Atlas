@@ -88,6 +88,21 @@ if ($script:hostLines -contains 'Migration process failed before confirmed commi
 }
 Write-Output 'Post-commit diagnostic display distinction: PASS'
 
+$sequenceFailureLine = '2026-11-22 12:34:56,789 [ERROR] Migration failed phase=Sequence reset; subphase=ALTER SEQUENCE execution; exception_type=ProgrammingError; sqlstate=42601; diagnostic=PostgreSQL ALTER SEQUENCE execution failed; details redacted.'
+$script:hostLines.Clear()
+$parsedSequenceFailure = ConvertFrom-SafeMigrationOutput -CapturedText $sequenceFailureLine
+if ($null -eq $parsedSequenceFailure -or $parsedSequenceFailure.Phase -cne 'Sequence reset' -or
+    $parsedSequenceFailure.Subphase -cne 'ALTER SEQUENCE execution' -or
+    $parsedSequenceFailure.ExceptionClass -cne 'ProgrammingError' -or $parsedSequenceFailure.SqlState -cne '42601') {
+    throw 'Sequence-reset subphase diagnostic was not parsed correctly.'
+}
+Show-SafeMigrationDiagnostics -CapturedText $sequenceFailureLine
+if (-not $script:hostLines.Contains('Migration phase: Sequence reset') -or
+    -not $script:hostLines.Contains('Migration subphase: ALTER SEQUENCE execution')) {
+    throw 'Sequence-reset outer phase and subphase were not displayed.'
+}
+Write-Output 'Sequence-reset subphase diagnostic display: PASS'
+
 $script:hostLines.Clear()
 $invalidSqlState = 'Migration failed phase=Data insertion; exception_type=IntegrityError; sqlstate=password; diagnostic=PostgreSQL data insertion failed; details redacted.'
 if ($null -ne (ConvertFrom-SafeMigrationOutput -CapturedText $invalidSqlState)) {
