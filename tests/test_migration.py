@@ -7,8 +7,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.dialects import registry
 
 from scripts.migrate_sqlite_to_postgres import (
+    SEQUENCE_DDL_GENERATION_QUERY,
     TABLE_DEFINITIONS,
     _migration_phase,
     _migration_transaction,
@@ -449,6 +451,20 @@ class MigrationUnitTests(unittest.TestCase):
                 self.assertEqual(engine.rollbacks, 1)
                 self.assertEqual(engine.connection.tables, set())
                 self.assertEqual(engine.connection.ddl, [])
+
+    def test_sequence_ddl_generation_query_compiles_for_pg8000_bind_parameters(self):
+        dialect = registry.load("postgresql.pg8000")()
+        compiled = SEQUENCE_DDL_GENERATION_QUERY.compile(dialect=dialect)
+        sql = str(compiled)
+
+        self.assertEqual(dialect.paramstyle, "format")
+        self.assertEqual(compiled.positiontup, ["sequence_name", "next_value"])
+        self.assertEqual(
+            re.findall(r"(?<!%)%s", sql),
+            ["%s", "%s"],
+        )
+        self.assertEqual(sql.count("%%s"), 2)
+        self.assertIn("ALTER SEQUENCE %%s RESTART WITH %%s", sql)
 
     def test_successful_migration_commits_verified_rows(self):
         engine = FakePostgresEngine()

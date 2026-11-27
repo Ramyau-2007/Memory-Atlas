@@ -11,6 +11,28 @@ $previousDatabaseUrl = $null
 $currentStage = 'setup'
 $migrationMayHaveStarted = $false
 
+function Read-NeonUriHidden {
+    $clipboardText = $null
+    try {
+        Write-Host 'Reading the Direct URI from the clipboard; its contents remain hidden.'
+        $clipboardText = Get-Clipboard -Raw -ErrorAction Stop
+        if ($null -eq $clipboardText -or [string]::IsNullOrEmpty([string]$clipboardText)) {
+            throw 'Clipboard input is empty.'
+        }
+        $clipboardText = [string]$clipboardText
+        if ([regex]::IsMatch($clipboardText, '[\r\n\u0085\u2028\u2029]')) {
+            throw 'Clipboard input must be one line.'
+        }
+        if ([regex]::IsMatch($clipboardText, '[\x00-\x1F\x7F]')) {
+            throw 'Clipboard input contains control characters.'
+        }
+        return $clipboardText
+    }
+    finally {
+        $clipboardText = $null
+    }
+}
+
 function Get-SafeOuterFailureMessage {
     param(
         [AllowNull()][string]$Stage,
@@ -36,30 +58,100 @@ function Get-SafeOuterFailureMessage {
 }
 
 function Get-NeonUriRejectionCategory {
-    param([AllowNull()][string]$Value)
+    param(
+        [AllowNull()][string]$Value,
+        [ref]$EncodedUriOutput
+    )
 
-    try {
-        $parsedUri = [System.Uri]$Value
-        if (-not $parsedUri.IsAbsoluteUri) {
-            return 'invalid URI'
+    if ($null -eq $Value) {
+        return 'hidden input empty'
+    }
+
+    # ReadLineHidden returns a plain .NET string with console echo disabled.
+    # Normalize only copy/paste whitespace and one leading Unicode BOM.
+    $normalizedValue = $Value.Trim()
+    if ($normalizedValue.StartsWith([string][char]0xFEFF, [System.StringComparison]::Ordinal)) {
+        $normalizedValue = $normalizedValue.Substring(1).TrimStart()
+    }
+    if ([string]::IsNullOrWhiteSpace($normalizedValue)) {
+        return 'hidden input empty'
+    }
+    if ($normalizedValue -match '[\x00-\x1F\x7F]') {
+        return 'input contains control characters'
+    }
+    if ($normalizedValue -match '[\u200B\u200E\u200F\u202A-\u202E\u2060-\u206F\uFEFF]') {
+        return 'input contains invisible formatting characters'
+    }
+
+    # Locate the host boundary from the right so raw URI delimiters in copied
+    # credentials (such as @, /, ? and #) stay inside the credential section.
+    # Encode the username and password separately, preserving existing %HH.
+    $credentialUriPattern = '^(?<prefix>[A-Za-z][A-Za-z0-9+.-]*://)(?<userInfo>.*)@(?<host>[^:/?#]+)(?<port>:\d+)?(?<suffix>[/\?#].*)?$'
+    $credentialUriMatch = [regex]::Match($normalizedValue, $credentialUriPattern)
+    $uriToParse = $normalizedValue
+    if ($credentialUriMatch.Success) {
+        $rawUserInfo = $credentialUriMatch.Groups['userInfo'].Value
+        if ($rawUserInfo -match '%(?![0-9A-Fa-f]{2})') {
+            return 'malformed credential percent escape'
         }
-        if ($parsedUri.Scheme -notin @('postgres', 'postgresql')) {
-            return 'unsupported scheme'
-        }
-        if ($parsedUri.Host -notmatch '\.neon\.tech$') {
-            return 'non-Neon host'
-        }
-        if ($parsedUri.Host -match '-pooler\.') {
-            return 'pooled endpoint'
-        }
-        if (-not $parsedUri.UserInfo.Contains(':')) {
+        $credentialColon = $rawUserInfo.IndexOf(':')
+        if ($credentialColon -lt 0) {
             return 'missing credential separator'
         }
-        return $null
+
+        $encodeCredentialComponent = {
+            param([string]$Component)
+            $builder = New-Object System.Text.StringBuilder
+            $position = 0
+            foreach ($escape in [regex]::Matches($Component, '%[0-9A-Fa-f]{2}')) {
+                if ($escape.Index -gt $position) {
+                    [void]$builder.Append([System.Uri]::EscapeDataString($Component.Substring($position, $escape.Index - $position)))
+                }
+                [void]$builder.Append($escape.Value)
+                $position = $escape.Index + $escape.Length
+            }
+            if ($position -lt $Component.Length) {
+                [void]$builder.Append([System.Uri]::EscapeDataString($Component.Substring($position)))
+            }
+            return $builder.ToString()
+        }
+
+        $rawUsername = $rawUserInfo.Substring(0, $credentialColon)
+        $rawPassword = $rawUserInfo.Substring($credentialColon + 1)
+        $safeUserInfo = (& $encodeCredentialComponent $rawUsername) + ':' + (& $encodeCredentialComponent $rawPassword)
+        $uriToParse = $credentialUriMatch.Groups['prefix'].Value + $safeUserInfo + '@' +
+            $credentialUriMatch.Groups['host'].Value + $credentialUriMatch.Groups['port'].Value +
+            $credentialUriMatch.Groups['suffix'].Value
     }
-    catch {
-        return 'invalid URI'
+
+    $parsedUri = $null
+    if (-not [System.Uri]::TryCreate($uriToParse, [System.UriKind]::Absolute, [ref]$parsedUri)) {
+        return 'System.Uri rejected syntax; reserved credential characters may require percent-encoding'
     }
+    if ($null -eq $parsedUri -or -not $parsedUri.IsAbsoluteUri) {
+        return 'URI is not absolute'
+    }
+    if ($parsedUri.Scheme -notin @('postgres', 'postgresql')) {
+        return 'unsupported scheme'
+    }
+    if ($parsedUri.Host -notmatch '\.neon\.tech$') {
+        return 'non-Neon host'
+    }
+    if ($parsedUri.Host -match '-pooler\.') {
+        return 'pooled endpoint'
+    }
+
+    $userInfo = $parsedUri.UserInfo
+    if (-not $userInfo.Contains(':')) {
+        return 'missing credential separator'
+    }
+    if ($userInfo -match '%(?![0-9A-Fa-f]{2})') {
+        return 'malformed credential percent escape'
+    }
+    if ($null -ne $EncodedUriOutput) {
+        $EncodedUriOutput.Value = $uriToParse
+    }
+    return $null
 }
 
 function ConvertFrom-SafeMigrationOutput {
@@ -229,52 +321,16 @@ try {
     Write-Host 'SQLite foreign-key check: 0 violations'
 
     $currentStage = 'hidden URI input'
-    if (-not ('MemoryAtlasHiddenInput' -as [type])) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-public static class MemoryAtlasHiddenInput
-{
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr GetStdHandle(int nStdHandle);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
-
-    public static string ReadLineHidden()
-    {
-        IntPtr handle = GetStdHandle(-10);
-        uint originalMode;
-        if (handle == IntPtr.Zero || !GetConsoleMode(handle, out originalMode))
-            throw new InvalidOperationException("Console input is unavailable.");
-        if (!SetConsoleMode(handle, originalMode & ~(uint)0x0004))
-            throw new InvalidOperationException("Could not disable console input echo.");
-        try
-        {
-            return Console.ReadLine() ?? "";
-        }
-        finally
-        {
-            SetConsoleMode(handle, originalMode);
-        }
-    }
-}
-'@ -ErrorAction Stop
-    }
-
-    Write-Host 'Enter the Neon DIRECT PostgreSQL URI (input is hidden):'
-    $secret = [MemoryAtlasHiddenInput]::ReadLineHidden()
+    $secret = Read-NeonUriHidden
 
     $currentStage = 'URI validation'
-    $uriRejectionCategory = Get-NeonUriRejectionCategory -Value $secret
+    $normalizedDatabaseUrl = $null
+    $uriRejectionCategory = Get-NeonUriRejectionCategory -Value $secret -EncodedUriOutput ([ref]$normalizedDatabaseUrl)
     if ($null -ne $uriRejectionCategory) {
         Write-Host ("Migration not started. URI validation rejected: {0}." -f $uriRejectionCategory)
         return
     }
+    $secret = $normalizedDatabaseUrl
 
     # The URI is never passed in process arguments. The migration tool checks
     # destination emptiness before writes and rechecks under locks in its transaction.

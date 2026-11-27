@@ -25,8 +25,9 @@ def _token_hash(token: str) -> str:
 
 
 def invitations_required() -> bool:
-    production_default = os.getenv("APP_ENV", "development").strip().lower() == "production"
-    return env_flag("DEMO_INVITATIONS_REQUIRED", production_default)
+    # Public registration is the default in every environment. Deployments
+    # that need a private demo can explicitly set DEMO_INVITATIONS_REQUIRED=true.
+    return env_flag("DEMO_INVITATIONS_REQUIRED", False)
 
 
 def create_invitation(expires_in_days: int = 7) -> tuple[str, str]:

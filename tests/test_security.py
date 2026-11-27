@@ -2,11 +2,66 @@ import asyncio
 import os
 import unittest
 from unittest.mock import patch
+from fastapi import HTTPException
+from starlette.requests import Request
 
-from app.security import RequestSecurityMiddleware
+from app.security import RequestSecurityMiddleware, limit_request, request_limiter
 
 
 class RequestSecurityMiddlewareTests(unittest.TestCase):
+    def setUp(self):
+        request_limiter.clear()
+
+    @staticmethod
+    def _request(client_ip, cloudflare_ip=None):
+        headers = []
+        if cloudflare_ip is not None:
+            headers.append((b"cf-connecting-ip", cloudflare_ip.encode("ascii")))
+        return Request({
+            "type": "http",
+            "method": "POST",
+            "path": "/api/register",
+            "headers": headers,
+            "client": (client_ip, 12345),
+        })
+
+    def test_render_rate_limits_use_validated_cloudflare_client_ip(self):
+        with patch.dict(os.environ, {
+            "RENDER": "true",
+            "REGISTER_RATE_LIMIT": "1",
+            "REGISTER_RATE_WINDOW_SECONDS": "60",
+        }, clear=False):
+            check = limit_request("register-test", "REGISTER_RATE_LIMIT", "REGISTER_RATE_WINDOW_SECONDS", 5, 3600)
+            check(self._request("10.0.0.1", "198.51.100.1"))
+            check(self._request("10.0.0.1", "198.51.100.2"))
+            with self.assertRaises(HTTPException) as error:
+                check(self._request("10.0.0.1", "198.51.100.1"))
+        self.assertEqual(error.exception.status_code, 429)
+
+    def test_non_render_requests_do_not_trust_forwarded_ip_headers(self):
+        with patch.dict(os.environ, {
+            "RENDER": "false",
+            "REGISTER_RATE_LIMIT": "1",
+            "REGISTER_RATE_WINDOW_SECONDS": "60",
+        }, clear=False):
+            check = limit_request("register-local-test", "REGISTER_RATE_LIMIT", "REGISTER_RATE_WINDOW_SECONDS", 5, 3600)
+            check(self._request("127.0.0.1", "198.51.100.1"))
+            with self.assertRaises(HTTPException) as error:
+                check(self._request("127.0.0.1", "198.51.100.2"))
+        self.assertEqual(error.exception.status_code, 429)
+
+    def test_invalid_render_client_ip_falls_back_to_proxy_peer(self):
+        with patch.dict(os.environ, {
+            "RENDER": "true",
+            "REGISTER_RATE_LIMIT": "1",
+            "REGISTER_RATE_WINDOW_SECONDS": "60",
+        }, clear=False):
+            check = limit_request("register-invalid-ip-test", "REGISTER_RATE_LIMIT", "REGISTER_RATE_WINDOW_SECONDS", 5, 3600)
+            check(self._request("10.0.0.1", "not-an-ip"))
+            with self.assertRaises(HTTPException) as error:
+                check(self._request("10.0.0.1", "also-not-an-ip"))
+        self.assertEqual(error.exception.status_code, 429)
+
     def test_chunked_body_is_stopped_after_crossing_configured_limit(self):
         seen=[]
         downstream_called=False

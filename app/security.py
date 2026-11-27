@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import threading
 import time
@@ -214,6 +215,16 @@ def limit_request(action: str, limit_env: str, window_env: str, default_limit: i
     """Build a FastAPI dependency for an IP-scoped request limit."""
     def dependency(request: Request) -> None:
         identity = request.client.host if request.client else "unknown"
+        # Render sends public traffic through Cloudflare. With Uvicorn proxy
+        # headers disabled, request.client.host is the shared proxy address.
+        # Trust Cloudflare's single-address header only on Render; callers
+        # outside Render must not be able to spoof their rate-limit identity.
+        if os.getenv("RENDER", "").strip().lower() == "true":
+            forwarded_ip = request.headers.get("cf-connecting-ip", "").strip()
+            try:
+                identity = str(ipaddress.ip_address(forwarded_ip))
+            except ValueError:
+                pass
         allowed, retry_after = request_limiter.allow(
             action, identity, positive_int(limit_env, default_limit), positive_int(window_env, default_window)
         )

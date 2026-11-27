@@ -45,14 +45,24 @@ Invoke-Expression $uriValidatorFunction.Extent.Text
 
 $uriValidationCases = @(
     @{ Name = 'postgresql direct URI'; Value = 'postgresql://demo_user:demo%21pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require'; Expected = $null },
+    @{ Name = 'surrounding whitespace'; Value = '  postgresql://demo_user:demo%21pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require  '; Expected = $null },
+    @{ Name = 'leading Unicode byte-order mark'; Value = ([string][char]0xFEFF) + 'postgresql://demo_user:demo%21pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = $null },
+    @{ Name = 'raw reserved at-sign in password'; Value = 'postgresql://demo_user:demo@pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = $null },
+    @{ Name = 'raw reserved slash in password'; Value = 'postgresql://demo_user:demo/pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = $null },
+    @{ Name = 'invisible formatting character'; Value = 'postgresql://demo_user:demo' + [char]0x200B + 'pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = 'input contains invisible formatting characters' },
     @{ Name = 'postgres direct URI'; Value = 'postgres://demo_user:demo%21pass@ep-pooler-demo.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = $null },
+    @{ Name = 'percent-encoded reserved characters in credentials with query parameters'; Value = 'postgresql://demo%40user:demo%40pass%3Awith%2Fchars@ep-example.us-east-2.aws.neon.tech:5432/neondb?sslmode=require&application_name=memory_atlas'; Expected = $null },
+    @{ Name = 'percent-encoded hash and question mark in password'; Value = 'postgres://demo_user:demo%23pass%3Fword@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = $null },
     @{ Name = 'pooled endpoint'; Value = 'postgresql://demo_user:demo%21pass@ep-example-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = 'pooled endpoint' },
     @{ Name = 'unsupported scheme'; Value = 'https://demo_user:demo%21pass@ep-example.us-east-2.aws.neon.tech/neondb'; Expected = 'unsupported scheme' },
-    @{ Name = 'malformed URI'; Value = 'postgresql://[malformed'; Expected = 'invalid URI' },
+    @{ Name = 'malformed URI'; Value = 'postgresql://[malformed'; Expected = 'System.Uri rejected syntax; reserved credential characters may require percent-encoding' },
+    @{ Name = 'malformed credential percent escape'; Value = 'postgresql://demo_user:demo%ZZpass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = 'malformed credential percent escape' },
+    @{ Name = 'malformed username percent escape'; Value = 'postgresql://demo%ZZuser:demo%21pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = 'malformed credential percent escape' },
+    @{ Name = 'truncated credential percent escape'; Value = 'postgresql://demo_user:demo%2@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = 'malformed credential percent escape' },
     @{ Name = 'missing credential separator'; Value = 'postgresql://ep-example.us-east-2.aws.neon.tech/neondb'; Expected = 'missing credential separator' },
     @{ Name = 'non-Neon host'; Value = 'postgresql://demo_user:demo%21pass@db.example.test/neondb'; Expected = 'non-Neon host' }
 )
-$allowedUriRejections = @('invalid URI', 'unsupported scheme', 'non-Neon host', 'pooled endpoint', 'missing credential separator')
+$allowedUriRejections = @('hidden input empty', 'input contains control characters', 'input contains invisible formatting characters', 'URI is not absolute', 'System.Uri rejected syntax; reserved credential characters may require percent-encoding', 'unsupported scheme', 'non-Neon host', 'pooled endpoint', 'missing credential separator', 'malformed credential percent escape')
 foreach ($case in $uriValidationCases) {
     $actual = Get-NeonUriRejectionCategory -Value $case.Value
     if ($actual -cne $case.Expected) {
@@ -62,6 +72,27 @@ foreach ($case in $uriValidationCases) {
         throw "URI validator returned a non-allowlisted rejection category for $($case.Name)."
     }
 }
+$credentialNormalizationCases = @(
+    @{ Name = 'reserved username and password characters'; Value = 'postgresql://demo/user:p@ss:/?#@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = 'postgresql://demo%2Fuser:p%40ss%3A%2F%3F%23@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require' },
+    @{ Name = 'existing percent escapes stay unchanged'; Value = 'postgresql://demo%40user:p%2fss%3A@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require'; Expected = 'postgresql://demo%40user:p%2fss%3A@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require' }
+)
+foreach ($case in $credentialNormalizationCases) {
+    $normalizedValue = $null
+    $actual = Get-NeonUriRejectionCategory -Value $case.Value -EncodedUriOutput ([ref]$normalizedValue)
+    if ($null -ne $actual -or $normalizedValue -cne $case.Expected) {
+        throw "Synthetic credential normalization case failed: $($case.Name)."
+    }
+}
+$malformedNormalizedValue = $null
+$malformedCategory = Get-NeonUriRejectionCategory -Value 'postgresql://demo%ZZuser:pass@ep-example.us-east-2.aws.neon.tech/neondb?sslmode=require' -EncodedUriOutput ([ref]$malformedNormalizedValue)
+if ($malformedCategory -cne 'malformed credential percent escape' -or $null -ne $malformedNormalizedValue) {
+    throw 'Malformed percent escape was not rejected before URI normalization.'
+}
+$uriValidationCall = [regex]::Match($wrapperSource, '(?m)^\s*\$uriRejectionCategory = Get-NeonUriRejectionCategory[^\r\n]+')
+if (-not $uriValidationCall.Success -or $wrapperSource -notmatch '(?m)^\s*\$secret = \$normalizedDatabaseUrl\s*$') {
+    throw 'Normalized URI is not assigned for the existing migration invocation.'
+}
+Write-Output 'Synthetic reserved credential encoding, existing escape preservation, and malformed escape rejection: PASS'
 $validatorCallIndex = $wrapperSource.IndexOf('$uriRejectionCategory = Get-NeonUriRejectionCategory', [System.StringComparison]::Ordinal)
 $pythonInvocationIndex = $wrapperSource.IndexOf('$migrationOutput = @(& $python -m scripts.migrate_sqlite_to_postgres', [System.StringComparison]::Ordinal)
 if ($validatorCallIndex -lt 0 -or $pythonInvocationIndex -le $validatorCallIndex) {

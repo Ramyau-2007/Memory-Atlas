@@ -794,6 +794,15 @@ class ApiWorkflowTests(unittest.TestCase):
             })
         self.assertEqual(direct.status_code, 400)
 
+    def test_production_registration_is_open_by_default(self):
+        with patch.dict(os.environ, {'APP_ENV':'production'}, clear=True):
+            mode = self.client.get('/api/session-mode')
+            response = self.client.post('/api/register', json={
+                'username':'production-open','password':'a-long-test-password'
+            })
+        self.assertFalse(mode.json()['invitation_required'])
+        self.assertEqual(response.status_code, 200, response.text)
+
     def test_cookie_auth_is_http_only_and_protects_cookie_authenticated_writes(self):
         with patch.dict(os.environ, {'SESSION_COOKIE_AUTH':'true','SESSION_COOKIE_SECURE':'false'}):
             login_response=self.client.post('/api/login',json={

@@ -283,6 +283,14 @@ def get_pg_table_counts(engine) -> dict[str, int]:
         return _pg_table_counts(conn)
 
 
+SEQUENCE_DDL_GENERATION_QUERY = text("""
+    SELECT format(
+        'ALTER SEQUENCE %%s RESTART WITH %%s',
+        CAST(:sequence_name AS regclass), :next_value
+    )
+""")
+
+
 def reset_sequences(conn) -> None:
     """Restart serial sequences transactionally after preserving source IDs."""
     for tdef in TABLE_DEFINITIONS:
@@ -304,12 +312,10 @@ def reset_sequences(conn) -> None:
                 raise RuntimeError(f"Could not determine the next sequence value for {table}.{pk}.")
 
         with _migration_subphase("ALTER SEQUENCE statement generation"):
-            alter_sequence = conn.execute(text("""
-                SELECT format(
-                    'ALTER SEQUENCE %s RESTART WITH %s',
-                    CAST(:sequence_name AS regclass), :next_value
-                )
-            """), {"sequence_name": sequence, "next_value": int(next_value)}).scalar()
+            alter_sequence = conn.execute(
+                SEQUENCE_DDL_GENERATION_QUERY,
+                {"sequence_name": sequence, "next_value": int(next_value)},
+            ).scalar()
             if not alter_sequence:
                 raise RuntimeError(f"Could not prepare the sequence update for {table}.{pk}.")
 
